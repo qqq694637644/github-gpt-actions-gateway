@@ -304,16 +304,13 @@ def test_workspace_inspect_search_and_read_files_do_not_need_pwsh(tmp_path: Path
     prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_inspect")))
 
     monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: "rg" if name == "rg" else None)
-    original_run = manager.git.run
 
-    async def fake_git_or_rg_run(args, **kwargs):
-        if args[0] == "git":
-            assert args[:5] == ["git", "ls-files", "-z", "--cached", "--others"]
-            assert "--exclude-standard" in args
-            return await original_run(args, **kwargs)
+    async def fake_rg_run(args, **kwargs):
         assert args[0] == "rg"
+        assert "--hidden" not in args
+        assert "--no-ignore" not in args
         assert "--ignore-file" not in args
-        assert "src/sample.py" in args
+        assert args[-1] in {"src", "."}
         return CommandResult(
             exit_code=0,
             stdout="\n".join(
@@ -328,7 +325,7 @@ def test_workspace_inspect_search_and_read_files_do_not_need_pwsh(tmp_path: Path
             truncated=False,
         )
 
-    monkeypatch.setattr(manager.git, "run", fake_git_or_rg_run)
+    monkeypatch.setattr(manager.git, "run", fake_rg_run)
 
     read_response = run(
         service.read_files(
@@ -385,27 +382,18 @@ def test_workspace_search_requires_ripgrep(tmp_path: Path, monkeypatch: pytest.M
     assert "ripgrep" in exc.value.message
 
 
-def test_workspace_search_filters_env_before_ripgrep_file_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    remote, source = make_local_repo(tmp_path)
-    (source / ".env").write_text("SECRET=blocked\n", encoding="utf-8")
-    (source / ".env.example").write_text("SECRET=example\n", encoding="utf-8")
-    git("add", ".env", ".env.example", cwd=source)
-    git("commit", "-m", "Add env files", cwd=source)
-    git("push", "origin", "gpt/task", cwd=source)
+def test_workspace_search_uses_ripgrep_default_filters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_env_ignore")))
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_rg_defaults")))
     monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: "rg" if name == "rg" else None)
     captured: dict[str, list[str]] = {}
-    original_run = manager.git.run
 
-    async def fake_git_or_rg_run(args, **kwargs):
-        if args[0] == "git":
-            captured["git_args"] = list(args)
-            return await original_run(args, **kwargs)
+    async def fake_rg_run(args, **kwargs):
         captured["args"] = list(args)
         return CommandResult(exit_code=1, stdout="", stderr="", duration_ms=2, truncated=False)
 
-    monkeypatch.setattr(manager.git, "run", fake_git_or_rg_run)
+    monkeypatch.setattr(manager.git, "run", fake_rg_run)
 
     response = run(
         service.search(
@@ -418,11 +406,11 @@ def test_workspace_search_filters_env_before_ripgrep_file_list(tmp_path: Path, m
 
     assert response.match_count == 0
     args = captured["args"]
-    assert captured["git_args"][:5] == ["git", "ls-files", "-z", "--cached", "--others"]
-    assert "--exclude-standard" in captured["git_args"]
+    assert args[0] == "rg"
+    assert "--hidden" not in args
+    assert "--no-ignore" not in args
     assert "--ignore-file" not in args
-    assert ".env" not in args
-    assert ".env.example" in args
+    assert args[-1] == "."
 
 
 def test_workspace_read_files_truncates_single_long_line_to_max_bytes(tmp_path: Path):
@@ -460,18 +448,16 @@ def test_workspace_search_and_inspect_respect_total_response_budget(tmp_path: Pa
     service, manager = make_service(tmp_path, remote)
     prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_budget")))
     monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: "rg" if name == "rg" else None)
-    original_run = manager.git.run
 
-    async def fake_git_or_rg_run(args, **kwargs):
-        if args[0] == "git":
-            return await original_run(args, **kwargs)
+    async def fake_rg_run(args, **kwargs):
+        assert args[0] == "rg"
         stdout = "\n".join(
             rg_match_event("src/many.py", idx + 1, line, start=4, match_text="target_symbol")
             for idx, line in enumerate(lines)
         )
         return CommandResult(exit_code=0, stdout=stdout + "\n", stderr="", duration_ms=4, truncated=False)
 
-    monkeypatch.setattr(manager.git, "run", fake_git_or_rg_run)
+    monkeypatch.setattr(manager.git, "run", fake_rg_run)
 
     search_response = run(
         service.search(

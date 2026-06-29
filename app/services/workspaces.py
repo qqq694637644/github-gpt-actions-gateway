@@ -82,7 +82,6 @@ _ALLOWED_ENV_READ_FILES = {".env.example", ".env.sample", ".env.template"}
 _MIN_STRUCTURED_RESPONSE_BYTES = 1024
 _SEARCH_LINE_MAX_BYTES = 4_000
 _SEARCH_SNIPPET_MAX_BYTES = 12_000
-_RIPGREP_MAX_PATH_ARG_BYTES = 24_000
 _TRUNCATION_MARKER = "\n...[truncated]"
 
 
@@ -336,89 +335,72 @@ class WorkspaceService:
         max_bytes: int,
     ) -> WorkspaceSearchResponse:
         paths = self._normalize_existing_tree_paths(repo_dir, request.paths)
-        file_paths = await self._git_search_file_paths(repo_dir, paths)
-        if not file_paths:
-            return WorkspaceSearchResponse(
-                workspace_id=workspace_id,
-                query=request.query,
-                engine="ripgrep",
-                matches=[],
-                match_count=0,
-                truncated=False,
-            )
-        base_args = [
+        args = [
             rg,
             "--json",
             "--line-number",
             "--column",
             "--color",
             "never",
-            "--no-ignore",
-            "--hidden",
         ]
         if not request.regex:
-            base_args.append("--fixed-strings")
+            args.append("--fixed-strings")
         if not request.case_sensitive:
-            base_args.append("--ignore-case")
-        matches: list[WorkspaceSearchMatch] = []
-        truncated = False
-        for chunk in _chunk_path_args(file_paths, max_arg_bytes=_RIPGREP_MAX_PATH_ARG_BYTES):
-            args = [*base_args, "--", request.query, *chunk]
-            result = await self.manager.git.run(
-                args,
-                cwd=repo_dir,
-                timeout=self.settings.workspace_default_timeout_seconds,
-                check=False,
-                allowed_exit_codes=(0, 1, 2),
-                max_output_bytes=max_bytes,
+            args.append("--ignore-case")
+        args.extend(["--", request.query, *paths])
+        result = await self.manager.git.run(
+            args,
+            cwd=repo_dir,
+            timeout=self.settings.workspace_default_timeout_seconds,
+            check=False,
+            allowed_exit_codes=(0, 1, 2),
+            max_output_bytes=max_bytes,
+        )
+        if result.exit_code == 2:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                "ripgrep rejected the search query.",
+                status_code=422,
+                details={"stderr": result.stderr},
             )
-            if result.exit_code == 2:
-                raise ApiError(
-                    ErrorCode.VALIDATION_ERROR,
-                    "ripgrep rejected the search query.",
-                    status_code=422,
-                    details={"stderr": result.stderr},
+        matches: list[WorkspaceSearchMatch] = []
+        truncated = result.truncated
+        for raw_line in result.stdout.splitlines():
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "match":
+                continue
+            data = event.get("data") or {}
+            raw_path = ((data.get("path") or {}).get("text") or "").replace("\\", "/")
+            if _path_is_excluded_from_inspection(raw_path):
+                continue
+            line_number = int(data.get("line_number") or 0)
+            line_text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
+            submatches = data.get("submatches") or []
+            column = None
+            if submatches and isinstance(submatches[0], dict):
+                column = int(submatches[0].get("start") or 0) + 1
+            line_text, line_truncated = _clip_text_to_bytes(line_text, _SEARCH_LINE_MAX_BYTES)
+            snippet_file = self._read_file_content(
+                repo_dir,
+                raw_path,
+                start_line=max(1, line_number - request.context_lines),
+                max_lines=(request.context_lines * 2) + 1,
+                max_bytes=min(max_bytes, _SEARCH_SNIPPET_MAX_BYTES),
+            )
+            truncated = truncated or line_truncated or snippet_file.truncated
+            matches.append(
+                WorkspaceSearchMatch(
+                    path=raw_path,
+                    line_number=line_number,
+                    column=column,
+                    line=line_text,
+                    snippet=snippet_file.content or None,
                 )
-            truncated = truncated or result.truncated
-            for raw_line in result.stdout.splitlines():
-                try:
-                    event = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") != "match":
-                    continue
-                data = event.get("data") or {}
-                raw_path = ((data.get("path") or {}).get("text") or "").replace("\\", "/")
-                if _path_is_excluded_from_inspection(raw_path):
-                    continue
-                line_number = int(data.get("line_number") or 0)
-                line_text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
-                submatches = data.get("submatches") or []
-                column = None
-                if submatches and isinstance(submatches[0], dict):
-                    column = int(submatches[0].get("start") or 0) + 1
-                line_text, line_truncated = _clip_text_to_bytes(line_text, _SEARCH_LINE_MAX_BYTES)
-                snippet_file = self._read_file_content(
-                    repo_dir,
-                    raw_path,
-                    start_line=max(1, line_number - request.context_lines),
-                    max_lines=(request.context_lines * 2) + 1,
-                    max_bytes=min(max_bytes, _SEARCH_SNIPPET_MAX_BYTES),
-                )
-                truncated = truncated or line_truncated or snippet_file.truncated
-                matches.append(
-                    WorkspaceSearchMatch(
-                        path=raw_path,
-                        line_number=line_number,
-                        column=column,
-                        line=line_text,
-                        snippet=snippet_file.content or None,
-                    )
-                )
-                if len(matches) >= request.max_matches:
-                    truncated = True
-                    break
-            if result.truncated or len(matches) >= request.max_matches:
+            )
+            if len(matches) >= request.max_matches:
                 truncated = True
                 break
         response = WorkspaceSearchResponse(
@@ -430,44 +412,6 @@ class WorkspaceService:
             truncated=truncated,
         )
         return self._fit_search_response(response, max_bytes)
-
-    async def _git_search_file_paths(self, repo_dir: Path, paths: list[str]) -> list[str]:
-        result = await self.manager.git.run(
-            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *paths],
-            cwd=repo_dir,
-            timeout=self.settings.workspace_default_timeout_seconds,
-            max_output_bytes=self.settings.workspace_max_diff_bytes,
-        )
-        if result.truncated:
-            raise ApiError(
-                ErrorCode.FILE_TOO_LARGE,
-                "Git file list is too large for workspaceSearch; narrow the requested paths.",
-                status_code=413,
-                details={"paths": paths, "max_bytes": self.settings.workspace_max_diff_bytes},
-            )
-        repo_root = repo_dir.resolve()
-        filtered: list[str] = []
-        for raw_path in result.stdout.split("\0"):
-            if not raw_path:
-                continue
-            raw_path = raw_path.replace("\\", "/")
-            try:
-                normalized = self.policy.assert_tree_path_allowed(raw_path)
-            except ApiError:
-                continue
-            if not normalized or normalized == ".":
-                continue
-            if _path_is_excluded_from_inspection(normalized) or self.policy.has_binary_extension(normalized):
-                continue
-            resolved = (repo_dir / normalized).resolve(strict=False)
-            try:
-                resolved.relative_to(repo_root)
-            except ValueError:
-                continue
-            if resolved.is_symlink() or not resolved.is_file():
-                continue
-            filtered.append(normalized)
-        return list(dict.fromkeys(filtered))
 
     def _tree_entries(self, repo_dir: Path, paths: list[str], *, max_depth: int, max_entries: int) -> tuple[list[WorkspaceTreeEntry], bool]:
         entries: list[WorkspaceTreeEntry] = []
@@ -1171,23 +1115,6 @@ def _clip_text_to_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
 
 def _model_json_bytes(model: Any) -> int:
     return len(model.model_dump_json().encode("utf-8"))
-
-
-def _chunk_path_args(paths: list[str], *, max_arg_bytes: int) -> list[list[str]]:
-    chunks: list[list[str]] = []
-    current: list[str] = []
-    current_bytes = 0
-    for path in paths:
-        path_bytes = len(path.encode("utf-8")) + 1
-        if current and current_bytes + path_bytes > max_arg_bytes:
-            chunks.append(current)
-            current = []
-            current_bytes = 0
-        current.append(path)
-        current_bytes += path_bytes
-    if current:
-        chunks.append(current)
-    return chunks
 
 
 def _join_repo_path(parent: str, child: str) -> str:

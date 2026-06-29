@@ -31,7 +31,7 @@ The platform is intended for personal maintenance workflows. The main safety bou
 
 Use `prepareWorkspace` with `base_ref` for read-only repository investigation, then inspect with `workspaceInspect`, `workspaceSearch`, `workspaceReadFiles`, `workspaceStatus`, `workspaceDiff`, PR readers, CI readers, job logs, run logs, and artifact listing. `workspaceExecPwsh` remains available for validation and complex repository commands, but it is not the default code-reading path.
 
-`workspaceSearch` is Git-scoped: the backend first asks Git for tracked and non-ignored untracked files under the requested paths, applies the workspace inspection path policy, and then passes that explicit file list to ripgrep. It does not let ripgrep recursively scan the raw workspace filesystem.
+`workspaceSearch` relies on ripgrep's default filtering behavior: it respects ignore files and skips hidden files/directories and binary files unless the caller explicitly searches a specific allowed path. The gateway does not pass `--hidden`, `--no-ignore`, or custom ignore-file overrides.
 
 Typical operations: `prepareWorkspace`, `workspaceInspect`, `workspaceSearch`, `workspaceReadFiles`, `workspaceStatus`, `workspaceDiff`, `getPullRequest`, `listPullRequests`, `getPullRequestFiles`, `queryCiStatus`, `queryFailedCiLog`, `getCiRun`, `getCiJobs`, `getJobLog`, `getRunLog`, `listArtifacts`.
 
