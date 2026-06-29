@@ -1,0 +1,47 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+myvenv/
+env/
+
+# 依赖与构建产物
+*.egg-info/
+.eggs/
+build/
+dist/
+site/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# 测试与静态检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 环境配置与密钥
+.env
+.env.*
+!.env.example
+
+# 项目运行时数据
+audit.db
+.tmp-manual-tests/
+.gpt-artifacts/
+
+# 生成文件
+openapi.json
+*.zip
