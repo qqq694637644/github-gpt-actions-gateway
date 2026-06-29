@@ -22,6 +22,9 @@ from app.models.workspaces import (
     WorkspaceApplyPatchRequest,
     WorkspaceCommitAndPushRequest,
     WorkspaceExecPwshRequest,
+    WorkspaceInspectRequest,
+    WorkspaceReadFilesRequest,
+    WorkspaceSearchRequest,
     WorkspaceStatusRequest,
     WorkspaceWriteFileRequest,
 )
@@ -49,6 +52,25 @@ class LocalGitHub:
 
     async def get_repository(self, owner: str, repo: str) -> dict:
         return {"default_branch": "main"}
+
+    async def get_branch_head(self, owner: str, repo: str, branch: str) -> str:
+        return git("rev-parse", f"refs/heads/{branch}", cwd=self.remote)
+
+    async def get_commit_object(self, owner: str, repo: str, sha: str) -> dict:
+        git("cat-file", "-e", f"{sha}^{{commit}}", cwd=self.remote)
+        return {"sha": sha}
+
+    async def create_ref(self, owner: str, repo: str, branch: str, sha: str) -> dict:
+        existing = subprocess.run(
+            ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+            cwd=self.remote,
+            text=True,
+            capture_output=True,
+        )
+        if existing.returncode == 0:
+            raise ApiError(ErrorCode.GITHUB_CONFLICT, "already exists", status_code=409)
+        git("update-ref", f"refs/heads/{branch}", sha, cwd=self.remote)
+        return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
 
     async def get_workflow_run(self, owner: str, repo: str, run_id: int) -> dict:
         return {
@@ -214,6 +236,86 @@ def test_exec_pwsh_rejects_timeout_above_configured_safety_limit(tmp_path: Path)
     assert exc.value.error_code == ErrorCode.VALIDATION_ERROR
     assert "safety limit" in exc.value.message
     assert exc.value.suggestion is not None and "dispatch a workflow" in exc.value.suggestion
+
+
+def test_prepare_can_create_or_continue_branch_before_workspace(tmp_path: Path):
+    remote, source = make_local_repo(tmp_path)
+    service, _ = make_service(tmp_path, remote)
+    main_sha = git("rev-parse", "main", cwd=source)
+
+    prepared = run(
+        service.prepare(
+            "acme",
+            "demo",
+            PrepareWorkspaceRequest(
+                mode="create_or_prepare_branch",
+                base_ref="main",
+                branch="gpt/created-by-prepare",
+                workspace_id="ws_create_prepare",
+            ),
+        )
+    )
+
+    assert prepared.branch == "gpt/created-by-prepare"
+    assert prepared.head_sha == main_sha
+    assert prepared.branch_created is True
+    assert prepared.branch_continued is False
+    assert prepared.branch_already_exists is False
+    assert prepared.branch_base_ref == "main"
+    assert prepared.branch_base_sha == main_sha
+    assert git("rev-parse", "refs/heads/gpt/created-by-prepare", cwd=remote) == main_sha
+
+
+def test_workspace_inspect_search_and_read_files_do_not_need_pwsh(tmp_path: Path):
+    remote, source = make_local_repo(tmp_path)
+    (source / "src").mkdir()
+    (source / "src" / "sample.py").write_text(
+        "def target_symbol():\n"
+        "    return 'needle'\n"
+        "\n"
+        "def other():\n"
+        "    return target_symbol()\n",
+        encoding="utf-8",
+    )
+    git("add", "src/sample.py", cwd=source)
+    git("commit", "-m", "Add sample source", cwd=source)
+    git("push", "origin", "gpt/task", cwd=source)
+    service, _ = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_inspect")))
+
+    read_response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=["src/sample.py"], max_lines=2),
+        )
+    )
+    assert read_response.files[0].content.startswith("1: def target_symbol")
+
+    search_response = run(
+        service.search(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceSearchRequest(query="target_symbol", paths=["src"], max_matches=5),
+        )
+    )
+    assert search_response.match_count >= 1
+    assert search_response.matches[0].path == "src/sample.py"
+    assert search_response.matches[0].snippet is not None
+
+    inspect_response = run(
+        service.inspect(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceInspectRequest(paths=["."], queries=["target_symbol"], max_read_files=1),
+        )
+    )
+    assert any(entry.path == "src/sample.py" for entry in inspect_response.tree)
+    assert inspect_response.searches[0].match_count >= 1
+    assert inspect_response.files[0].path == "src/sample.py"
 
 
 def test_sync_run_artifacts_to_workspace_downloads_and_skips_unchanged_run(tmp_path: Path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import zipfile
@@ -14,6 +15,7 @@ from typing import Any
 from app.config.settings import Settings
 from app.errors import ApiError, ErrorCode
 from app.github.client import GitHubClient
+from app.models.branches import CreateWorkBranchRequest, CreateWorkBranchResponse
 from app.models.ci import SyncedRunArtifact, SyncRunArtifactsToWorkspaceRequest, SyncRunArtifactsToWorkspaceResponse
 from app.models.workspaces import (
     PrepareWorkspaceRequest,
@@ -26,15 +28,26 @@ from app.models.workspaces import (
     WorkspaceDiffResponse,
     WorkspaceExecPwshRequest,
     WorkspaceExecPwshResponse,
+    WorkspaceFileContent,
+    WorkspaceInspectRequest,
+    WorkspaceInspectResponse,
+    WorkspaceInspectSearchResult,
     WorkspacePrepareDiagnostics,
+    WorkspaceReadFilesRequest,
+    WorkspaceReadFilesResponse,
     WorkspaceResetRequest,
     WorkspaceResetResponse,
+    WorkspaceSearchMatch,
+    WorkspaceSearchRequest,
+    WorkspaceSearchResponse,
     WorkspaceStatusRequest,
     WorkspaceStatusResponse,
+    WorkspaceTreeEntry,
     WorkspaceWriteFileRequest,
     WorkspaceWriteFileResponse,
 )
 from app.policy.rules import Policy
+from app.services.branches import BranchService
 from app.storage.audit import AuditStore, canonical_hash
 from app.workspace.exec import PwshExecutor
 from app.workspace.manager import WorkspaceManager, command_hash
@@ -54,6 +67,20 @@ _ARTIFACTS_ROOT = ".gpt-artifacts"
 _ARTIFACTS_EXCLUDE_ENTRY = ".gpt-artifacts/"
 _ARTIFACT_PAGE_SIZE = 100
 _SAFE_ARTIFACT_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_EXCLUDED_INSPECT_DIRS = {
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    "coverage",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "env",
+    ".tox",
+    ".nox",
+}
+_ALLOWED_ENV_READ_FILES = {".env.example", ".env.sample", ".env.template"}
 
 
 class WorkspaceService:
@@ -66,12 +93,34 @@ class WorkspaceService:
         self.executor = PwshExecutor(settings)
 
     async def prepare(self, owner: str, repo: str, request: PrepareWorkspaceRequest) -> PrepareWorkspaceResponse:
+        branch_result: CreateWorkBranchResponse | None = None
+        branch = request.branch
+        base_ref = request.base_ref
+        source_pr_number = request.source_pr_number
+
+        if request.mode == "create_or_prepare_branch":
+            branch_result = await BranchService(self.github, self.policy, self.settings, self.audit).create_work_branch(
+                owner,
+                repo,
+                CreateWorkBranchRequest(
+                    idempotency_key=request.idempotency_key,
+                    base_ref=request.base_ref,
+                    base_sha=request.base_sha,
+                    branch=request.branch,
+                    purpose_slug=request.purpose_slug,
+                    continue_if_exists=request.continue_if_exists,
+                ),
+            )
+            branch = branch_result.branch
+            base_ref = None
+            source_pr_number = None
+
         result = await self.manager.prepare(
             owner=owner,
             repo=repo,
-            branch=request.branch,
-            source_pr_number=request.source_pr_number,
-            base_ref=request.base_ref,
+            branch=branch,
+            source_pr_number=source_pr_number,
+            base_ref=base_ref,
             workspace_id=request.workspace_id,
             refresh=request.refresh,
             clean=request.clean,
@@ -85,7 +134,18 @@ class WorkspaceService:
             head_sha_after=result.meta.head_sha,
             metadata=self._prepare_metadata(result),
         )
-        return self._response_from_prepare_result(owner, repo, result)
+        response = self._response_from_prepare_result(owner, repo, result)
+        if branch_result is not None:
+            response = response.model_copy(
+                update={
+                    "branch_created": branch_result.created,
+                    "branch_continued": branch_result.continued,
+                    "branch_already_exists": branch_result.already_exists,
+                    "branch_base_ref": branch_result.base_ref,
+                    "branch_base_sha": branch_result.base_sha,
+                }
+            )
+        return response
 
 
     async def exec_pwsh(self, owner: str, repo: str, workspace_id: str, request: WorkspaceExecPwshRequest) -> WorkspaceExecPwshResponse:
@@ -132,6 +192,411 @@ class WorkspaceService:
             truncated=result.truncated,
             duration_ms=result.duration_ms,
         )
+
+    async def read_files(self, owner: str, repo: str, workspace_id: str, request: WorkspaceReadFilesRequest) -> WorkspaceReadFilesResponse:
+        meta = self._assert_workspace(owner, repo, workspace_id)
+        repo_dir = self.manager.repo_dir(workspace_id)
+        max_bytes = self._bounded_output_bytes(request.max_bytes_per_file)
+        with self.manager.lock(workspace_id):
+            files = [
+                self._read_file_content(
+                    repo_dir,
+                    path,
+                    start_line=request.start_line,
+                    max_lines=request.max_lines,
+                    max_bytes=max_bytes,
+                )
+                for path in request.paths
+            ]
+        self._audit(
+            operation_id="workspaceReadFiles",
+            owner=owner,
+            repo=repo,
+            workspace_id=workspace_id,
+            branch=meta.branch,
+            head_sha_before=meta.head_sha,
+            metadata={"paths": request.paths},
+        )
+        return WorkspaceReadFilesResponse(
+            workspace_id=workspace_id,
+            files=files,
+            truncated=any(item.truncated for item in files),
+        )
+
+    async def search(self, owner: str, repo: str, workspace_id: str, request: WorkspaceSearchRequest) -> WorkspaceSearchResponse:
+        meta = self._assert_workspace(owner, repo, workspace_id)
+        repo_dir = self.manager.repo_dir(workspace_id)
+        with self.manager.lock(workspace_id):
+            response = await self._search_workspace(workspace_id, repo_dir, request)
+        self._audit(
+            operation_id="workspaceSearch",
+            owner=owner,
+            repo=repo,
+            workspace_id=workspace_id,
+            branch=meta.branch,
+            head_sha_before=meta.head_sha,
+            command_hash=command_hash(request.query),
+            metadata={"paths": request.paths, "match_count": response.match_count, "engine": response.engine},
+        )
+        return response
+
+    async def inspect(self, owner: str, repo: str, workspace_id: str, request: WorkspaceInspectRequest) -> WorkspaceInspectResponse:
+        meta = self._assert_workspace(owner, repo, workspace_id)
+        repo_dir = self.manager.repo_dir(workspace_id)
+        max_file_bytes = self._bounded_output_bytes(request.max_bytes_per_file)
+        with self.manager.lock(workspace_id):
+            tree, tree_truncated = self._tree_entries(
+                repo_dir,
+                request.paths,
+                max_depth=request.max_depth,
+                max_entries=request.max_tree_entries,
+            )
+            searches: list[WorkspaceInspectSearchResult] = []
+            related: dict[str, int] = {}
+            for query in request.queries:
+                search_response = await self._search_workspace(
+                    workspace_id,
+                    repo_dir,
+                    WorkspaceSearchRequest(
+                        query=query,
+                        paths=request.paths,
+                        context_lines=request.context_lines,
+                        max_matches=request.max_search_matches,
+                    ),
+                )
+                searches.append(
+                    WorkspaceInspectSearchResult(
+                        query=query,
+                        engine=search_response.engine,
+                        matches=search_response.matches,
+                        match_count=search_response.match_count,
+                        truncated=search_response.truncated,
+                    )
+                )
+                if request.max_read_files > 0:
+                    for match in search_response.matches:
+                        related.setdefault(match.path, match.line_number)
+                        if len(related) >= request.max_read_files:
+                            break
+
+            files = [
+                self._read_file_content(
+                    repo_dir,
+                    path,
+                    start_line=max(1, first_line - request.context_lines),
+                    max_lines=request.max_file_lines,
+                    max_bytes=max_file_bytes,
+                )
+                for path, first_line in list(related.items())[: request.max_read_files]
+            ]
+        self._audit(
+            operation_id="workspaceInspect",
+            owner=owner,
+            repo=repo,
+            workspace_id=workspace_id,
+            branch=meta.branch,
+            head_sha_before=meta.head_sha,
+            metadata={"paths": request.paths, "queries": request.queries},
+        )
+        return WorkspaceInspectResponse(
+            workspace_id=workspace_id,
+            tree=tree,
+            tree_truncated=tree_truncated,
+            searches=searches,
+            files=files,
+            truncated=tree_truncated or any(item.truncated for item in files) or any(item.truncated for item in searches),
+        )
+
+    async def _search_workspace(self, workspace_id: str, repo_dir: Path, request: WorkspaceSearchRequest) -> WorkspaceSearchResponse:
+        max_bytes = self._bounded_output_bytes(request.max_bytes)
+        rg = shutil.which("rg")
+        if rg:
+            try:
+                response = await self._search_with_ripgrep(workspace_id, repo_dir, request, rg, max_bytes=max_bytes)
+                return response
+            except ApiError:
+                raise
+        return self._search_with_python(workspace_id, repo_dir, request, max_bytes=max_bytes)
+
+    async def _search_with_ripgrep(
+        self,
+        workspace_id: str,
+        repo_dir: Path,
+        request: WorkspaceSearchRequest,
+        rg: str,
+        *,
+        max_bytes: int,
+    ) -> WorkspaceSearchResponse:
+        paths = self._normalize_existing_tree_paths(repo_dir, request.paths)
+        args = [
+            rg,
+            "--json",
+            "--line-number",
+            "--column",
+            "--color",
+            "never",
+            "--hidden",
+        ]
+        for dirname in sorted(_EXCLUDED_INSPECT_DIRS):
+            args.extend(["--glob", f"!**/{dirname}/**"])
+        if not request.regex:
+            args.append("--fixed-strings")
+        if not request.case_sensitive:
+            args.append("--ignore-case")
+        args.extend(["--", request.query, *paths])
+        result = await self.manager.git.run(
+            args,
+            cwd=repo_dir,
+            timeout=self.settings.workspace_default_timeout_seconds,
+            check=False,
+            allowed_exit_codes=(0, 1, 2),
+            max_output_bytes=max_bytes,
+        )
+        if result.exit_code == 2:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                "ripgrep rejected the search query.",
+                status_code=422,
+                details={"stderr": result.stderr},
+            )
+        matches: list[WorkspaceSearchMatch] = []
+        truncated = result.truncated
+        for raw_line in result.stdout.splitlines():
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "match":
+                continue
+            data = event.get("data") or {}
+            raw_path = ((data.get("path") or {}).get("text") or "").replace("\\", "/")
+            if _path_is_excluded_from_inspection(raw_path):
+                continue
+            line_number = int(data.get("line_number") or 0)
+            line_text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
+            submatches = data.get("submatches") or []
+            column = None
+            if submatches and isinstance(submatches[0], dict):
+                column = int(submatches[0].get("start") or 0) + 1
+            snippet = self._read_file_content(
+                repo_dir,
+                raw_path,
+                start_line=max(1, line_number - request.context_lines),
+                max_lines=(request.context_lines * 2) + 1,
+                max_bytes=min(max_bytes, 12_000),
+            ).content
+            matches.append(
+                WorkspaceSearchMatch(
+                    path=raw_path,
+                    line_number=line_number,
+                    column=column,
+                    line=line_text,
+                    snippet=snippet or None,
+                )
+            )
+            if len(matches) >= request.max_matches:
+                truncated = True
+                break
+        return WorkspaceSearchResponse(
+            workspace_id=workspace_id,
+            query=request.query,
+            engine="ripgrep",
+            matches=matches,
+            match_count=len(matches),
+            truncated=truncated,
+        )
+
+    def _search_with_python(self, workspace_id: str, repo_dir: Path, request: WorkspaceSearchRequest, *, max_bytes: int) -> WorkspaceSearchResponse:
+        paths = self._normalize_existing_tree_paths(repo_dir, request.paths)
+        flags = 0 if request.case_sensitive else re.IGNORECASE
+        regex = None
+        needle = request.query if request.case_sensitive else request.query.lower()
+        if request.regex:
+            try:
+                regex = re.compile(request.query, flags)
+            except re.error as exc:
+                raise ApiError(ErrorCode.VALIDATION_ERROR, "Invalid regular expression.", status_code=422, details={"error": str(exc)}) from exc
+        matches: list[WorkspaceSearchMatch] = []
+        truncated = False
+        for file_path in self._iter_candidate_files(repo_dir, paths):
+            relative = _relative_repo_path(repo_dir, file_path)
+            try:
+                data = file_path.read_bytes()
+                if len(data) > max(self.settings.workspace_max_diff_bytes, max_bytes):
+                    continue
+                assert_text_bytes(data, path=relative)
+                text = data.decode("utf-8")
+            except Exception:
+                continue
+            for line_number, line_text in enumerate(text.splitlines(), start=1):
+                if regex:
+                    found = regex.search(line_text)
+                    column = found.start() + 1 if found else None
+                else:
+                    haystack = line_text if request.case_sensitive else line_text.lower()
+                    idx = haystack.find(needle)
+                    column = idx + 1 if idx >= 0 else None
+                if column is None:
+                    continue
+                snippet = self._read_file_content(
+                    repo_dir,
+                    relative,
+                    start_line=max(1, line_number - request.context_lines),
+                    max_lines=(request.context_lines * 2) + 1,
+                    max_bytes=min(max_bytes, 12_000),
+                ).content
+                matches.append(
+                    WorkspaceSearchMatch(
+                        path=relative,
+                        line_number=line_number,
+                        column=column,
+                        line=line_text,
+                        snippet=snippet or None,
+                    )
+                )
+                if len(matches) >= request.max_matches:
+                    truncated = True
+                    return WorkspaceSearchResponse(
+                        workspace_id=workspace_id,
+                        query=request.query,
+                        engine="python_fallback",
+                        matches=matches,
+                        match_count=len(matches),
+                        truncated=truncated,
+                    )
+        return WorkspaceSearchResponse(
+            workspace_id=workspace_id,
+            query=request.query,
+            engine="python_fallback",
+            matches=matches,
+            match_count=len(matches),
+            truncated=truncated,
+        )
+
+    def _tree_entries(self, repo_dir: Path, paths: list[str], *, max_depth: int, max_entries: int) -> tuple[list[WorkspaceTreeEntry], bool]:
+        entries: list[WorkspaceTreeEntry] = []
+        truncated = False
+        for base in self._normalize_existing_tree_paths(repo_dir, paths):
+            base_path = repo_dir if base == "." else repo_dir / base
+            if base_path.is_file():
+                entries.append(WorkspaceTreeEntry(path=base, type="file", depth=0, bytes=base_path.stat().st_size))
+                continue
+            for current, dirs, files in os.walk(base_path):
+                current_path = Path(current)
+                rel_current = _relative_repo_path(repo_dir, current_path) if current_path != repo_dir else "."
+                depth = 0 if rel_current == "." else len(PurePosixPath(rel_current).parts)
+                if depth >= max_depth:
+                    dirs[:] = []
+                    continue
+                dirs[:] = [item for item in sorted(dirs) if not _path_is_excluded_from_inspection(_join_repo_path(rel_current, item))]
+                for dirname in dirs:
+                    rel = _join_repo_path(rel_current, dirname)
+                    entries.append(WorkspaceTreeEntry(path=rel, type="dir", depth=len(PurePosixPath(rel).parts)))
+                    if len(entries) >= max_entries:
+                        return entries, True
+                for filename in sorted(files):
+                    rel = _join_repo_path(rel_current, filename)
+                    if _path_is_excluded_from_inspection(rel):
+                        continue
+                    file_path = current_path / filename
+                    entries.append(WorkspaceTreeEntry(path=rel, type="file", depth=len(PurePosixPath(rel).parts), bytes=file_path.stat().st_size))
+                    if len(entries) >= max_entries:
+                        return entries, True
+        return entries, truncated
+
+    def _read_file_content(self, repo_dir: Path, path: str, *, start_line: int, max_lines: int, max_bytes: int) -> WorkspaceFileContent:
+        try:
+            normalized = self.policy.assert_tree_path_allowed(path)
+            if normalized is None or normalized == ".":
+                raise ApiError(ErrorCode.WORKSPACE_WRITE_INVALID_PATH, "A file path is required.", status_code=400, details={"path": path})
+            if _path_is_excluded_from_inspection(normalized):
+                raise ApiError(ErrorCode.WORKSPACE_POLICY_VIOLATION, "Path is excluded from workspace inspection.", status_code=403, details={"path": normalized})
+            resolved = (repo_dir / normalized).resolve(strict=False)
+            resolved.relative_to(repo_dir.resolve())
+            if resolved.is_symlink():
+                raise ApiError(ErrorCode.WORKSPACE_POLICY_VIOLATION, "Workspace read operations refuse symlinks.", status_code=403, details={"path": normalized})
+            if not resolved.is_file():
+                raise ApiError(ErrorCode.WORKSPACE_FILE_NOT_FOUND, "Workspace file was not found.", status_code=404, details={"path": normalized})
+            if self.policy.has_binary_extension(normalized):
+                raise ApiError(ErrorCode.WORKSPACE_BINARY_NOT_ALLOWED, "Binary-like files cannot be read by this gateway.", status_code=403, details={"path": normalized})
+            data = resolved.read_bytes()
+            assert_text_bytes(data, path=normalized)
+            text = data.decode("utf-8")
+            lines = text.splitlines()
+            start_idx = start_line - 1
+            selected = lines[start_idx : start_idx + max_lines]
+            output_lines: list[str] = []
+            output_bytes = 0
+            truncated = start_idx + len(selected) < len(lines)
+            for offset, line in enumerate(selected, start=start_line):
+                rendered = f"{offset}: {line}"
+                rendered_bytes = len((rendered + "\n").encode("utf-8"))
+                if output_lines and output_bytes + rendered_bytes > max_bytes:
+                    truncated = True
+                    break
+                output_lines.append(rendered)
+                output_bytes += rendered_bytes
+            end_line = start_line + len(output_lines) - 1 if output_lines else None
+            return WorkspaceFileContent(
+                path=normalized,
+                start_line=start_line,
+                end_line=end_line,
+                total_lines=len(lines),
+                bytes=len(data),
+                sha256=hashlib.sha256(data).hexdigest(),
+                content="\n".join(output_lines),
+                truncated=truncated,
+            )
+        except Exception as exc:
+            if isinstance(exc, ApiError):
+                message = exc.message
+            else:
+                message = str(exc)
+            return WorkspaceFileContent(path=path, start_line=start_line, error=message, truncated=False)
+
+    def _normalize_existing_tree_paths(self, repo_dir: Path, paths: list[str]) -> list[str]:
+        normalized_paths: list[str] = []
+        repo_root = repo_dir.resolve()
+        for raw_path in paths:
+            normalized = self.policy.assert_tree_path_allowed(raw_path) or "."
+            if _path_is_excluded_from_inspection(normalized):
+                continue
+            resolved = repo_root if normalized == "." else (repo_dir / normalized).resolve(strict=False)
+            try:
+                resolved.relative_to(repo_root)
+            except ValueError as exc:
+                raise ApiError(ErrorCode.PATH_NOT_ALLOWED, "Resolved path escapes the workspace repository.", status_code=403, details={"path": normalized}) from exc
+            if not resolved.exists():
+                raise ApiError(ErrorCode.WORKSPACE_FILE_NOT_FOUND, "Workspace path was not found.", status_code=404, details={"path": normalized})
+            normalized_paths.append(normalized)
+        if not normalized_paths:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                "All requested paths are excluded from workspace inspection.",
+                status_code=422,
+                details={"paths": paths},
+            )
+        return normalized_paths
+
+    def _iter_candidate_files(self, repo_dir: Path, paths: list[str]):
+        for base in paths:
+            base_path = repo_dir if base == "." else repo_dir / base
+            if base_path.is_file():
+                if not _path_is_excluded_from_inspection(base):
+                    yield base_path
+                continue
+            for current, dirs, files in os.walk(base_path):
+                current_path = Path(current)
+                rel_current = _relative_repo_path(repo_dir, current_path) if current_path != repo_dir else "."
+                dirs[:] = [item for item in sorted(dirs) if not _path_is_excluded_from_inspection(_join_repo_path(rel_current, item))]
+                for filename in sorted(files):
+                    rel = _join_repo_path(rel_current, filename)
+                    if _path_is_excluded_from_inspection(rel) or self.policy.has_binary_extension(rel):
+                        continue
+                    yield current_path / filename
+
+    def _bounded_output_bytes(self, requested: int | None) -> int:
+        return min(requested or self.settings.workspace_max_output_bytes, self.settings.workspace_max_output_bytes)
 
     async def status(self, owner: str, repo: str, workspace_id: str, request: WorkspaceStatusRequest) -> WorkspaceStatusResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
@@ -637,6 +1102,25 @@ class WorkspaceService:
             "workspace_duration_ms": result.workspace_duration_ms,
             "total_duration_ms": result.total_duration_ms,
         }
+
+
+def _path_is_excluded_from_inspection(path: str) -> bool:
+    normalized = path.replace("\\", "/").strip("/")
+    if not normalized or normalized == ".":
+        return False
+    parts = PurePosixPath(normalized).parts
+    if any(part in _EXCLUDED_INSPECT_DIRS for part in parts):
+        return True
+    filename = parts[-1]
+    if (filename == ".env" or filename.startswith(".env.")) and filename not in _ALLOWED_ENV_READ_FILES:
+        return True
+    return False
+
+
+def _join_repo_path(parent: str, child: str) -> str:
+    if parent in {"", "."}:
+        return child.replace("\\", "/")
+    return f"{parent.rstrip('/')}/{child}".replace("\\", "/")
 
 
 def _artifact_manifest_records(raw_artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:

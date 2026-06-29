@@ -1,16 +1,27 @@
 from app.main import app
-from scripts.export_openapi import PUBLIC_OPERATION_IDS, collect_operation_ids, mark_all_operations_nonconsequential
+from scripts.export_openapi import (
+    PUBLIC_OPERATION_IDS,
+    collect_operation_ids,
+    filter_public_operations,
+    mark_all_operations_nonconsequential,
+)
 
 
 def test_openapi_contains_only_v2_operation_ids():
     schema = app.openapi()
+    filter_public_operations(schema)
     assert collect_operation_ids(schema) == PUBLIC_OPERATION_IDS
-    assert len(PUBLIC_OPERATION_IDS) == 29
+    assert len(PUBLIC_OPERATION_IDS) == 28
+    assert "listCaches" not in PUBLIC_OPERATION_IDS
+    assert "deleteCache" not in PUBLIC_OPERATION_IDS
+    assert "workspaceReset" not in PUBLIC_OPERATION_IDS
+    assert "createWorkBranch" not in PUBLIC_OPERATION_IDS
 
 
 def test_export_marks_all_public_operations_low_risk_nonconsequential():
     schema = app.openapi()
 
+    filter_public_operations(schema)
     mark_all_operations_nonconsequential(schema)
 
     for path_item in schema["paths"].values():
@@ -40,19 +51,19 @@ def _schema_properties(schema: dict, path: str) -> set[str]:
 
 def test_workspace_responses_exclude_implicit_state_fields():
     schema = app.openapi()
+    filter_public_operations(schema)
 
     assert "dirty" not in _schema_properties(schema, "/repos/{owner}/{repo}/workspaces/prepare")
     assert "changed_files" not in _schema_properties(schema, "/repos/{owner}/{repo}/workspaces/prepare")
     assert "changed_files" not in _schema_properties(schema, "/repos/{owner}/{repo}/workspaces/{workspace_id}/diff")
-    assert "dirty" not in _schema_properties(schema, "/repos/{owner}/{repo}/workspaces/{workspace_id}/reset")
     assert "truncated" not in _schema_properties(schema, "/repos/{owner}/{repo}/workspaces/{workspace_id}/apply-patch")
     assert "changed_files" not in _schema_properties(schema, "/repos/{owner}/{repo}/workspaces/{workspace_id}/artifacts/sync-run")
     assert "diff_stat" not in _schema_properties(schema, "/repos/{owner}/{repo}/workspaces/{workspace_id}/artifacts/sync-run")
-    assert "commit_url" not in _schema_properties(schema, "/repos/{owner}/{repo}/branches/create-work-branch")
 
 
 def test_ci_responses_exclude_duplicate_log_aliases():
     schema = app.openapi()
+    filter_public_operations(schema)
 
     assert "workflow_run" not in _schema_properties(schema, "/repos/{owner}/{repo}/ci/runs/get")
     assert "log" not in _schema_properties(schema, "/repos/{owner}/{repo}/ci/jobs/log")
@@ -65,15 +76,14 @@ def test_ci_responses_exclude_duplicate_log_aliases():
 
 def test_ci_status_runs_exclude_jobs_and_cache_delete_uses_precise_counts():
     schema = app.openapi()
+    filter_public_operations(schema)
     ci_status = schema["components"]["schemas"]["CIStatusResponse"]["properties"]
     workflow_run_schema = ci_status["workflow_runs"]["items"]["$ref"].rsplit("/", 1)[-1]
     run_summary = schema["components"]["schemas"][workflow_run_schema]["properties"]
     ci_run = schema["components"]["schemas"]["CIRun"]["properties"]
-    delete_cache = _schema_properties(schema, "/repos/{owner}/{repo}/ci/caches/delete")
 
     assert workflow_run_schema == "CIRunSummary"
     assert "jobs" not in run_summary
     assert "jobs" in ci_run
-    assert "matched_count" not in delete_cache
-    assert "deleted_caches" not in delete_cache
-    assert {"requested_count", "selected_count", "deleted_count", "requested_caches", "selected_caches"} <= delete_cache
+    assert "/repos/{owner}/{repo}/ci/caches/list" not in schema["paths"]
+    assert "/repos/{owner}/{repo}/ci/caches/delete" not in schema["paths"]
