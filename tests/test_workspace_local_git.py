@@ -490,6 +490,59 @@ def test_workspace_read_files_refuses_symlink_before_resolving(tmp_path: Path):
     assert str(repo_dir) not in (file.error or "")
 
 
+def test_workspace_read_files_refuses_symlink_directory_component(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_read_symlink_dir")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    link_path = repo_dir / "visible-link"
+    try:
+        link_path.symlink_to(".git", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not available in this test environment: {exc}")
+
+    response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=["visible-link/config"]),
+        )
+    )
+
+    file = response.files[0]
+    assert file.content == ""
+    assert file.error == "Workspace read operations refuse symlinks."
+    assert "hidden config" not in file.content
+    assert str(repo_dir) not in (file.error or "")
+
+
+def test_workspace_inspect_refuses_symlink_directory_path(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_inspect_symlink_dir")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    link_path = repo_dir / "visible-link"
+    try:
+        link_path.symlink_to(".git", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not available in this test environment: {exc}")
+
+    with pytest.raises(ApiError) as exc:
+        run(
+            service.inspect(
+                "acme",
+                "demo",
+                prepared.workspace_id,
+                WorkspaceInspectRequest(paths=["visible-link"]),
+            )
+        )
+
+    assert exc.value.error_code == ErrorCode.WORKSPACE_POLICY_VIOLATION
+    assert exc.value.message == "Workspace inspection operations refuse symlinks."
+    assert str(repo_dir) not in str(exc.value.details)
+
+
 def test_workspace_search_and_inspect_respect_total_response_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     remote, source = make_local_repo(tmp_path)
     (source / "src").mkdir()

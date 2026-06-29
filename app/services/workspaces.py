@@ -455,8 +455,7 @@ class WorkspaceService:
                 raise ApiError(ErrorCode.WORKSPACE_POLICY_VIOLATION, "Path is excluded from workspace inspection.", status_code=403, details={"path": normalized})
             repo_root = repo_dir.resolve()
             candidate = repo_dir / normalized
-            if candidate.is_symlink():
-                raise ApiError(ErrorCode.WORKSPACE_POLICY_VIOLATION, "Workspace read operations refuse symlinks.", status_code=403, details={"path": normalized})
+            _assert_no_symlink_components(repo_dir, normalized, message="Workspace read operations refuse symlinks.")
             resolved = candidate.resolve(strict=False)
             try:
                 resolved.relative_to(repo_root)
@@ -517,6 +516,8 @@ class WorkspaceService:
             normalized = self.policy.assert_tree_path_allowed(raw_path) or "."
             if _path_is_excluded_from_inspection(normalized):
                 continue
+            if normalized != ".":
+                _assert_no_symlink_components(repo_dir, normalized, message="Workspace inspection operations refuse symlinks.")
             resolved = repo_root if normalized == "." else (repo_dir / normalized).resolve(strict=False)
             try:
                 resolved.relative_to(repo_root)
@@ -1125,6 +1126,19 @@ def _path_is_excluded_from_inspection(path: str) -> bool:
     if (filename == ".env" or filename.startswith(".env.")) and filename not in _ALLOWED_ENV_READ_FILES:
         return True
     return False
+
+
+def _assert_no_symlink_components(repo_dir: Path, normalized_path: str, *, message: str) -> None:
+    current = repo_dir
+    for part in PurePosixPath(normalized_path).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ApiError(
+                ErrorCode.WORKSPACE_POLICY_VIOLATION,
+                message,
+                status_code=403,
+                details={"path": normalized_path},
+            )
 
 
 def _clip_text_to_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
