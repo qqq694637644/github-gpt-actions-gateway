@@ -29,21 +29,23 @@ The platform is intended for personal maintenance workflows. The main safety bou
 
 ### L0 read-only investigation
 
-Use `prepareWorkspace` with `base_ref` for read-only repository investigation, then inspect with `workspaceExecPwsh`, `workspaceStatus`, `workspaceDiff`, PR readers, CI readers, job logs, run logs, artifact listing, and cache listing.
+Use `prepareWorkspace` with `base_ref` for read-only repository investigation, then inspect with `workspaceInspect`, `workspaceSearch`, `workspaceReadFiles`, `workspaceStatus`, `workspaceDiff`, PR readers, CI readers, job logs, run logs, and artifact listing. `workspaceExecPwsh` remains available for validation and complex repository commands, but it is not the default code-reading path.
 
-Typical operations: `prepareWorkspace`, `workspaceExecPwsh`, `workspaceStatus`, `workspaceDiff`, `getPullRequest`, `listPullRequests`, `getPullRequestFiles`, `queryCiStatus`, `queryFailedCiLog`, `getCiRun`, `getCiJobs`, `getJobLog`, `getRunLog`, `listArtifacts`, `listCaches`.
+`workspaceSearch` is Git-scoped: the backend first asks Git for tracked and non-ignored untracked files under the requested paths, applies the workspace inspection path policy, and then passes that explicit file list to ripgrep. It does not let ripgrep recursively scan the raw workspace filesystem.
+
+Typical operations: `prepareWorkspace`, `workspaceInspect`, `workspaceSearch`, `workspaceReadFiles`, `workspaceStatus`, `workspaceDiff`, `getPullRequest`, `listPullRequests`, `getPullRequestFiles`, `queryCiStatus`, `queryFailedCiLog`, `getCiRun`, `getCiJobs`, `getJobLog`, `getRunLog`, `listArtifacts`.
 
 ### L1 local workspace changes
 
 Use a prepared branch workspace for local-only edits. `workspaceApplyPatch` is preferred for small auditable text patches. `workspaceWriteFile` is for complete UTF-8 text file creation or replacement. These operations do not commit, push, create PRs, or trigger CI.
 
-Typical operations: `workspaceApplyPatch`, `workspaceWriteFile`, `workspaceReset`, `syncRunArtifactsToWorkspace`.
+Typical operations: `workspaceApplyPatch`, `workspaceWriteFile`, `syncRunArtifactsToWorkspace`.
 
 ### L2 publish / PR
 
-Use `createWorkBranch`, `workspaceCommitAndPush`, and PR operations to publish reviewed workspace changes to GitHub. Publishing allows any explicit branch name and requires the remote branch head to equal `expected_head_sha`.
+Use `prepareWorkspace(mode="create_or_prepare_branch")`, `workspaceCommitAndPush`, and PR operations to publish reviewed workspace changes to GitHub. Branch creation/continuation and workspace preparation are intentionally consolidated into `prepareWorkspace`. Publishing allows any explicit branch name and requires the remote branch head to equal `expected_head_sha`.
 
-Typical operations: `createWorkBranch`, `workspaceCommitAndPush`, `createPullRequest`, `updatePullRequest`, `commentPullRequest`.
+Typical operations: `prepareWorkspace`, `workspaceCommitAndPush`, `createPullRequest`, `updatePullRequest`, `commentPullRequest`.
 
 ### L3 CI diagnostics and workflow operations
 
@@ -51,23 +53,22 @@ Use CI status, failed-log summaries, full job logs, run-log archives, safe artif
 
 Typical operations: `queryCiStatus`, `queryFailedCiLog`, `getCiRun`, `getCiJobs`, `getJobLog`, `getRunLog`, `listArtifacts`, `syncRunArtifactsToWorkspace`, `dispatchWorkflow`, `rerunWorkflowRun`, `rerunWorkflowJob`.
 
-### L4 merge and cache deletion
+### L4 merge
 
-Merge and cache deletion are high-risk operations. Merge requires a current `expected_head_sha` and a non-draft open PR. Cache deletion defaults to dry run and actual deletion requires explicit confirmation or verified expected metadata.
+Merge is a high-risk operation. Merge requires a current `expected_head_sha` and a non-draft open PR.
 
-Typical operations: `mergePullRequest`, `deleteCache`.
+Typical operations: `mergePullRequest`.
 
 ## Standard implementation flow
 
-1. **Create branch:** call `createWorkBranch` from the intended base ref.
-2. **Prepare workspace:** call `prepareWorkspace` with the returned or requested branch and a `ws_` workspace id when deterministic reuse is helpful.
-3. **Inspect:** use `workspaceExecPwsh` to list structure, search relevant files, and read source/tests/config before editing.
-4. **Edit:** use `workspaceApplyPatch` for small text edits or `workspaceWriteFile` for full UTF-8 file replacement.
-5. **Validate:** run targeted tests, lint, type checks, schema checks, or the smallest meaningful smoke test inside the workspace.
-6. **Diff:** call `workspaceDiff` before publishing.
-7. **Commit/push:** call `workspaceCommitAndPush` with the latest `expected_head_sha`.
-8. **Create PR:** call `createPullRequest`, or reuse the existing open PR returned by the API.
-9. **Query CI:** call `queryCiStatus` by PR number, branch, commit SHA, or workflow dispatch query hint.
+1. **Create or prepare branch workspace:** call `prepareWorkspace(mode="create_or_prepare_branch")` with the intended base ref or base SHA, optional branch, and a `ws_` workspace id when deterministic reuse is helpful.
+2. **Inspect:** use `workspaceInspect` first, then `workspaceSearch` or `workspaceReadFiles` for follow-up reading. Use `workspaceExecPwsh` only when the inspect/read APIs are insufficient.
+3. **Edit:** use `workspaceApplyPatch` for small text edits or `workspaceWriteFile` for full UTF-8 file replacement.
+4. **Validate:** run targeted tests, lint, type checks, schema checks, or the smallest meaningful smoke test inside the workspace.
+5. **Diff:** call `workspaceDiff` before publishing.
+6. **Commit/push:** call `workspaceCommitAndPush` with the latest `expected_head_sha`.
+7. **Create PR:** call `createPullRequest`, or reuse the existing open PR returned by the API.
+8. **Query CI:** call `queryCiStatus` by PR number, branch, commit SHA, or workflow dispatch query hint.
 
 If a commit was created locally but push failed, retrying `workspaceCommitAndPush` with the same expected remote head can recover by pushing the existing local commit instead of creating a duplicate commit.
 
@@ -101,9 +102,11 @@ Use `dispatchWorkflow` for `workflow_dispatch` workflows when an empty commit is
 
 Use `rerunWorkflowJob` for a single clearly flaky job. Use `rerunWorkflowRun` when the whole run failed due to runner, network, cache, or platform issues. Avoid reruns when the logs show a deterministic code failure.
 
-## Cache maintenance flow
+## Backend-only cache maintenance flow
 
-Start with `listCaches` and narrow by key/ref. Then run `deleteCache` with its default `dry_run=true` to inspect the selected cache ids, keys, refs, and sizes.
+Actions cache list/delete routes remain implemented for backend maintenance, but they are filtered out of the exported GPT Actions OpenAPI schema and are not public GPT Action tools.
+
+For direct backend maintenance, start with `listCaches` and narrow by key/ref. Then run `deleteCache` with its default `dry_run=true` to inspect the selected cache ids, keys, refs, and sizes.
 
 Actual deletion requires either `confirm=true` after review or exact expected metadata such as `expected_key`, `expected_ref`, and `expected_size_in_bytes`. Selectors that match more entries than `max_delete` are refused. Deleting by `cache_id` does not fetch metadata; inspect with `listCaches` first, then retry with `confirm=true`.
 

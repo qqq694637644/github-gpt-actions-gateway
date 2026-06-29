@@ -141,13 +141,13 @@ class WorkspaceSearchRequest(GatewayBaseModel):
     paths: list[str] = Field(default_factory=lambda: ["."], min_length=1, max_length=50)
     context_lines: int = Field(default=2, ge=0, le=20)
     max_matches: int = Field(default=100, ge=1, le=1000)
-    max_bytes: int | None = Field(default=None, ge=1)
+    max_bytes: int | None = Field(default=None, ge=1024, description="Maximum serialized search response size in bytes.")
 
 
 class WorkspaceSearchResponse(GatewayBaseModel):
     workspace_id: str
     query: str
-    engine: Literal["ripgrep", "python_fallback"]
+    engine: Literal["ripgrep"]
     matches: list[WorkspaceSearchMatch]
     match_count: int
     truncated: bool = False
@@ -163,11 +163,12 @@ class WorkspaceInspectRequest(GatewayBaseModel):
     max_read_files: int = Field(default=10, ge=0, le=50)
     max_file_lines: int = Field(default=120, ge=1, le=5000)
     max_bytes_per_file: int | None = Field(default=None, ge=1)
+    max_bytes: int | None = Field(default=None, ge=1024, description="Maximum serialized inspect response size in bytes.")
 
 
 class WorkspaceInspectSearchResult(GatewayBaseModel):
     query: str
-    engine: Literal["ripgrep", "python_fallback"]
+    engine: Literal["ripgrep"]
     matches: list[WorkspaceSearchMatch]
     match_count: int
     truncated: bool = False
@@ -269,14 +270,3 @@ class WorkspaceCommitAndPushResponse(GatewayBaseModel):
     dry_run: bool
 
 
-class WorkspaceResetRequest(GatewayBaseModel):
-    branch: str
-    target: Literal["remote_head"] = "remote_head"
-    clean_untracked: bool = True
-
-
-class WorkspaceResetResponse(GatewayBaseModel):
-    workspace_id: str
-    branch: str
-    head_sha: str
-    removed_untracked_files: list[str]

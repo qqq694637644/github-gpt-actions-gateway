@@ -35,8 +35,6 @@ from app.models.workspaces import (
     WorkspacePrepareDiagnostics,
     WorkspaceReadFilesRequest,
     WorkspaceReadFilesResponse,
-    WorkspaceResetRequest,
-    WorkspaceResetResponse,
     WorkspaceSearchMatch,
     WorkspaceSearchRequest,
     WorkspaceSearchResponse,
@@ -81,6 +79,11 @@ _EXCLUDED_INSPECT_DIRS = {
     ".nox",
 }
 _ALLOWED_ENV_READ_FILES = {".env.example", ".env.sample", ".env.template"}
+_MIN_STRUCTURED_RESPONSE_BYTES = 1024
+_SEARCH_LINE_MAX_BYTES = 4_000
+_SEARCH_SNIPPET_MAX_BYTES = 12_000
+_RIPGREP_MAX_PATH_ARG_BYTES = 24_000
+_TRUNCATION_MARKER = "\n...[truncated]"
 
 
 class WorkspaceService:
@@ -244,6 +247,7 @@ class WorkspaceService:
         meta = self._assert_workspace(owner, repo, workspace_id)
         repo_dir = self.manager.repo_dir(workspace_id)
         max_file_bytes = self._bounded_output_bytes(request.max_bytes_per_file)
+        max_response_bytes = self._bounded_output_bytes(request.max_bytes, minimum=_MIN_STRUCTURED_RESPONSE_BYTES)
         with self.manager.lock(workspace_id):
             tree, tree_truncated = self._tree_entries(
                 repo_dir,
@@ -262,6 +266,7 @@ class WorkspaceService:
                         paths=request.paths,
                         context_lines=request.context_lines,
                         max_matches=request.max_search_matches,
+                        max_bytes=max_response_bytes,
                     ),
                 )
                 searches.append(
@@ -298,7 +303,7 @@ class WorkspaceService:
             head_sha_before=meta.head_sha,
             metadata={"paths": request.paths, "queries": request.queries},
         )
-        return WorkspaceInspectResponse(
+        response = WorkspaceInspectResponse(
             workspace_id=workspace_id,
             tree=tree,
             tree_truncated=tree_truncated,
@@ -306,17 +311,20 @@ class WorkspaceService:
             files=files,
             truncated=tree_truncated or any(item.truncated for item in files) or any(item.truncated for item in searches),
         )
+        return self._fit_inspect_response(response, max_response_bytes)
 
     async def _search_workspace(self, workspace_id: str, repo_dir: Path, request: WorkspaceSearchRequest) -> WorkspaceSearchResponse:
-        max_bytes = self._bounded_output_bytes(request.max_bytes)
+        max_bytes = self._bounded_output_bytes(request.max_bytes, minimum=_MIN_STRUCTURED_RESPONSE_BYTES)
         rg = shutil.which("rg")
-        if rg:
-            try:
-                response = await self._search_with_ripgrep(workspace_id, repo_dir, request, rg, max_bytes=max_bytes)
-                return response
-            except ApiError:
-                raise
-        return self._search_with_python(workspace_id, repo_dir, request, max_bytes=max_bytes)
+        if not rg:
+            raise ApiError(
+                ErrorCode.WORKSPACE_EXEC_FAILED,
+                "ripgrep (rg) is required for workspaceSearch/workspaceInspect but was not found on PATH.",
+                status_code=500,
+                suggestion="Install ripgrep in the gateway runtime image so workspaceSearch fails loudly instead of silently falling back to a slow scanner.",
+                details={"executable": "rg"},
+            )
+        return await self._search_with_ripgrep(workspace_id, repo_dir, request, rg, max_bytes=max_bytes)
 
     async def _search_with_ripgrep(
         self,
@@ -328,76 +336,92 @@ class WorkspaceService:
         max_bytes: int,
     ) -> WorkspaceSearchResponse:
         paths = self._normalize_existing_tree_paths(repo_dir, request.paths)
-        args = [
+        file_paths = await self._git_search_file_paths(repo_dir, paths)
+        if not file_paths:
+            return WorkspaceSearchResponse(
+                workspace_id=workspace_id,
+                query=request.query,
+                engine="ripgrep",
+                matches=[],
+                match_count=0,
+                truncated=False,
+            )
+        base_args = [
             rg,
             "--json",
             "--line-number",
             "--column",
             "--color",
             "never",
+            "--no-ignore",
             "--hidden",
         ]
-        for dirname in sorted(_EXCLUDED_INSPECT_DIRS):
-            args.extend(["--glob", f"!**/{dirname}/**"])
         if not request.regex:
-            args.append("--fixed-strings")
+            base_args.append("--fixed-strings")
         if not request.case_sensitive:
-            args.append("--ignore-case")
-        args.extend(["--", request.query, *paths])
-        result = await self.manager.git.run(
-            args,
-            cwd=repo_dir,
-            timeout=self.settings.workspace_default_timeout_seconds,
-            check=False,
-            allowed_exit_codes=(0, 1, 2),
-            max_output_bytes=max_bytes,
-        )
-        if result.exit_code == 2:
-            raise ApiError(
-                ErrorCode.VALIDATION_ERROR,
-                "ripgrep rejected the search query.",
-                status_code=422,
-                details={"stderr": result.stderr},
-            )
+            base_args.append("--ignore-case")
         matches: list[WorkspaceSearchMatch] = []
-        truncated = result.truncated
-        for raw_line in result.stdout.splitlines():
-            try:
-                event = json.loads(raw_line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") != "match":
-                continue
-            data = event.get("data") or {}
-            raw_path = ((data.get("path") or {}).get("text") or "").replace("\\", "/")
-            if _path_is_excluded_from_inspection(raw_path):
-                continue
-            line_number = int(data.get("line_number") or 0)
-            line_text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
-            submatches = data.get("submatches") or []
-            column = None
-            if submatches and isinstance(submatches[0], dict):
-                column = int(submatches[0].get("start") or 0) + 1
-            snippet = self._read_file_content(
-                repo_dir,
-                raw_path,
-                start_line=max(1, line_number - request.context_lines),
-                max_lines=(request.context_lines * 2) + 1,
-                max_bytes=min(max_bytes, 12_000),
-            ).content
-            matches.append(
-                WorkspaceSearchMatch(
-                    path=raw_path,
-                    line_number=line_number,
-                    column=column,
-                    line=line_text,
-                    snippet=snippet or None,
-                )
+        truncated = False
+        for chunk in _chunk_path_args(file_paths, max_arg_bytes=_RIPGREP_MAX_PATH_ARG_BYTES):
+            args = [*base_args, "--", request.query, *chunk]
+            result = await self.manager.git.run(
+                args,
+                cwd=repo_dir,
+                timeout=self.settings.workspace_default_timeout_seconds,
+                check=False,
+                allowed_exit_codes=(0, 1, 2),
+                max_output_bytes=max_bytes,
             )
-            if len(matches) >= request.max_matches:
+            if result.exit_code == 2:
+                raise ApiError(
+                    ErrorCode.VALIDATION_ERROR,
+                    "ripgrep rejected the search query.",
+                    status_code=422,
+                    details={"stderr": result.stderr},
+                )
+            truncated = truncated or result.truncated
+            for raw_line in result.stdout.splitlines():
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "match":
+                    continue
+                data = event.get("data") or {}
+                raw_path = ((data.get("path") or {}).get("text") or "").replace("\\", "/")
+                if _path_is_excluded_from_inspection(raw_path):
+                    continue
+                line_number = int(data.get("line_number") or 0)
+                line_text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
+                submatches = data.get("submatches") or []
+                column = None
+                if submatches and isinstance(submatches[0], dict):
+                    column = int(submatches[0].get("start") or 0) + 1
+                line_text, line_truncated = _clip_text_to_bytes(line_text, _SEARCH_LINE_MAX_BYTES)
+                snippet_file = self._read_file_content(
+                    repo_dir,
+                    raw_path,
+                    start_line=max(1, line_number - request.context_lines),
+                    max_lines=(request.context_lines * 2) + 1,
+                    max_bytes=min(max_bytes, _SEARCH_SNIPPET_MAX_BYTES),
+                )
+                truncated = truncated or line_truncated or snippet_file.truncated
+                matches.append(
+                    WorkspaceSearchMatch(
+                        path=raw_path,
+                        line_number=line_number,
+                        column=column,
+                        line=line_text,
+                        snippet=snippet_file.content or None,
+                    )
+                )
+                if len(matches) >= request.max_matches:
+                    truncated = True
+                    break
+            if result.truncated or len(matches) >= request.max_matches:
                 truncated = True
                 break
-        return WorkspaceSearchResponse(
+        response = WorkspaceSearchResponse(
             workspace_id=workspace_id,
             query=request.query,
             engine="ripgrep",
@@ -405,73 +429,45 @@ class WorkspaceService:
             match_count=len(matches),
             truncated=truncated,
         )
+        return self._fit_search_response(response, max_bytes)
 
-    def _search_with_python(self, workspace_id: str, repo_dir: Path, request: WorkspaceSearchRequest, *, max_bytes: int) -> WorkspaceSearchResponse:
-        paths = self._normalize_existing_tree_paths(repo_dir, request.paths)
-        flags = 0 if request.case_sensitive else re.IGNORECASE
-        regex = None
-        needle = request.query if request.case_sensitive else request.query.lower()
-        if request.regex:
-            try:
-                regex = re.compile(request.query, flags)
-            except re.error as exc:
-                raise ApiError(ErrorCode.VALIDATION_ERROR, "Invalid regular expression.", status_code=422, details={"error": str(exc)}) from exc
-        matches: list[WorkspaceSearchMatch] = []
-        truncated = False
-        for file_path in self._iter_candidate_files(repo_dir, paths):
-            relative = _relative_repo_path(repo_dir, file_path)
-            try:
-                data = file_path.read_bytes()
-                if len(data) > max(self.settings.workspace_max_diff_bytes, max_bytes):
-                    continue
-                assert_text_bytes(data, path=relative)
-                text = data.decode("utf-8")
-            except Exception:
-                continue
-            for line_number, line_text in enumerate(text.splitlines(), start=1):
-                if regex:
-                    found = regex.search(line_text)
-                    column = found.start() + 1 if found else None
-                else:
-                    haystack = line_text if request.case_sensitive else line_text.lower()
-                    idx = haystack.find(needle)
-                    column = idx + 1 if idx >= 0 else None
-                if column is None:
-                    continue
-                snippet = self._read_file_content(
-                    repo_dir,
-                    relative,
-                    start_line=max(1, line_number - request.context_lines),
-                    max_lines=(request.context_lines * 2) + 1,
-                    max_bytes=min(max_bytes, 12_000),
-                ).content
-                matches.append(
-                    WorkspaceSearchMatch(
-                        path=relative,
-                        line_number=line_number,
-                        column=column,
-                        line=line_text,
-                        snippet=snippet or None,
-                    )
-                )
-                if len(matches) >= request.max_matches:
-                    truncated = True
-                    return WorkspaceSearchResponse(
-                        workspace_id=workspace_id,
-                        query=request.query,
-                        engine="python_fallback",
-                        matches=matches,
-                        match_count=len(matches),
-                        truncated=truncated,
-                    )
-        return WorkspaceSearchResponse(
-            workspace_id=workspace_id,
-            query=request.query,
-            engine="python_fallback",
-            matches=matches,
-            match_count=len(matches),
-            truncated=truncated,
+    async def _git_search_file_paths(self, repo_dir: Path, paths: list[str]) -> list[str]:
+        result = await self.manager.git.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *paths],
+            cwd=repo_dir,
+            timeout=self.settings.workspace_default_timeout_seconds,
+            max_output_bytes=self.settings.workspace_max_diff_bytes,
         )
+        if result.truncated:
+            raise ApiError(
+                ErrorCode.FILE_TOO_LARGE,
+                "Git file list is too large for workspaceSearch; narrow the requested paths.",
+                status_code=413,
+                details={"paths": paths, "max_bytes": self.settings.workspace_max_diff_bytes},
+            )
+        repo_root = repo_dir.resolve()
+        filtered: list[str] = []
+        for raw_path in result.stdout.split("\0"):
+            if not raw_path:
+                continue
+            raw_path = raw_path.replace("\\", "/")
+            try:
+                normalized = self.policy.assert_tree_path_allowed(raw_path)
+            except ApiError:
+                continue
+            if not normalized or normalized == ".":
+                continue
+            if _path_is_excluded_from_inspection(normalized) or self.policy.has_binary_extension(normalized):
+                continue
+            resolved = (repo_dir / normalized).resolve(strict=False)
+            try:
+                resolved.relative_to(repo_root)
+            except ValueError:
+                continue
+            if resolved.is_symlink() or not resolved.is_file():
+                continue
+            filtered.append(normalized)
+        return list(dict.fromkeys(filtered))
 
     def _tree_entries(self, repo_dir: Path, paths: list[str], *, max_depth: int, max_entries: int) -> tuple[list[WorkspaceTreeEntry], bool]:
         entries: list[WorkspaceTreeEntry] = []
@@ -531,12 +527,21 @@ class WorkspaceService:
             for offset, line in enumerate(selected, start=start_line):
                 rendered = f"{offset}: {line}"
                 rendered_bytes = len((rendered + "\n").encode("utf-8"))
-                if output_lines and output_bytes + rendered_bytes > max_bytes:
+                if rendered_bytes > max_bytes:
+                    clipped, _ = _clip_text_to_bytes(rendered, max_bytes)
+                    if clipped:
+                        output_lines.append(clipped)
+                        output_bytes += len(clipped.encode("utf-8"))
+                    truncated = True
+                    break
+                if output_bytes + rendered_bytes > max_bytes:
                     truncated = True
                     break
                 output_lines.append(rendered)
                 output_bytes += rendered_bytes
             end_line = start_line + len(output_lines) - 1 if output_lines else None
+            content = "\n".join(output_lines)
+            content, content_truncated = _clip_text_to_bytes(content, max_bytes)
             return WorkspaceFileContent(
                 path=normalized,
                 start_line=start_line,
@@ -544,8 +549,8 @@ class WorkspaceService:
                 total_lines=len(lines),
                 bytes=len(data),
                 sha256=hashlib.sha256(data).hexdigest(),
-                content="\n".join(output_lines),
-                truncated=truncated,
+                content=content,
+                truncated=truncated or content_truncated,
             )
         except Exception as exc:
             if isinstance(exc, ApiError):
@@ -578,25 +583,79 @@ class WorkspaceService:
             )
         return normalized_paths
 
-    def _iter_candidate_files(self, repo_dir: Path, paths: list[str]):
-        for base in paths:
-            base_path = repo_dir if base == "." else repo_dir / base
-            if base_path.is_file():
-                if not _path_is_excluded_from_inspection(base):
-                    yield base_path
-                continue
-            for current, dirs, files in os.walk(base_path):
-                current_path = Path(current)
-                rel_current = _relative_repo_path(repo_dir, current_path) if current_path != repo_dir else "."
-                dirs[:] = [item for item in sorted(dirs) if not _path_is_excluded_from_inspection(_join_repo_path(rel_current, item))]
-                for filename in sorted(files):
-                    rel = _join_repo_path(rel_current, filename)
-                    if _path_is_excluded_from_inspection(rel) or self.policy.has_binary_extension(rel):
-                        continue
-                    yield current_path / filename
+    def _bounded_output_bytes(self, requested: int | None, *, minimum: int = 1) -> int:
+        max_bytes = min(requested or self.settings.workspace_max_output_bytes, self.settings.workspace_max_output_bytes)
+        if max_bytes < minimum:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                "Requested output byte budget is too small for this workspace response.",
+                status_code=422,
+                details={"requested_max_bytes": max_bytes, "minimum_max_bytes": minimum},
+            )
+        return max_bytes
 
-    def _bounded_output_bytes(self, requested: int | None) -> int:
-        return min(requested or self.settings.workspace_max_output_bytes, self.settings.workspace_max_output_bytes)
+    def _fit_search_response(self, response: WorkspaceSearchResponse, max_bytes: int) -> WorkspaceSearchResponse:
+        while _model_json_bytes(response) > max_bytes and response.matches:
+            matches = list(response.matches)
+            last = matches[-1]
+            if last.snippet:
+                matches[-1] = last.model_copy(update={"snippet": None})
+            elif last.line:
+                matches[-1] = last.model_copy(update={"line": ""})
+            else:
+                matches.pop()
+            response = response.model_copy(update={"matches": matches, "match_count": len(matches), "truncated": True})
+        if _model_json_bytes(response) > max_bytes:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                "max_bytes is too small for the workspaceSearch response envelope.",
+                status_code=422,
+                details={"max_bytes": max_bytes, "minimum_max_bytes": _MIN_STRUCTURED_RESPONSE_BYTES},
+            )
+        return response
+
+    def _fit_inspect_response(self, response: WorkspaceInspectResponse, max_bytes: int) -> WorkspaceInspectResponse:
+        while _model_json_bytes(response) > max_bytes:
+            if response.files:
+                files = list(response.files)
+                last_file = files[-1]
+                if last_file.content:
+                    files[-1] = last_file.model_copy(update={"content": "", "truncated": True})
+                else:
+                    files.pop()
+                response = response.model_copy(update={"files": files, "truncated": True})
+                continue
+            if any(search.matches for search in response.searches):
+                searches = list(response.searches)
+                for index in range(len(searches) - 1, -1, -1):
+                    search = searches[index]
+                    if not search.matches:
+                        continue
+                    matches = list(search.matches)
+                    last_match = matches[-1]
+                    if last_match.snippet:
+                        matches[-1] = last_match.model_copy(update={"snippet": None})
+                    elif last_match.line:
+                        matches[-1] = last_match.model_copy(update={"line": ""})
+                    else:
+                        matches.pop()
+                    searches[index] = search.model_copy(update={"matches": matches, "match_count": len(matches), "truncated": True})
+                    break
+                response = response.model_copy(update={"searches": searches, "truncated": True})
+                continue
+            if response.tree:
+                response = response.model_copy(update={"tree": response.tree[:-1], "tree_truncated": True, "truncated": True})
+                continue
+            if response.searches:
+                response = response.model_copy(update={"searches": response.searches[:-1], "truncated": True})
+                continue
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                "max_bytes is too small for the workspaceInspect response envelope.",
+                status_code=422,
+                details={"max_bytes": max_bytes, "minimum_max_bytes": _MIN_STRUCTURED_RESPONSE_BYTES},
+            )
+        return response
 
     async def status(self, owner: str, repo: str, workspace_id: str, request: WorkspaceStatusRequest) -> WorkspaceStatusResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
@@ -917,24 +976,6 @@ class WorkspaceService:
             self.audit.save_idempotent_response(scope=scope, key=request.idempotency_key, request_payload=payload, response_payload=response.model_dump())
         return response
 
-    async def reset(self, owner: str, repo: str, workspace_id: str, request: WorkspaceResetRequest) -> WorkspaceResetResponse:
-        meta = self._assert_workspace(owner, repo, workspace_id)
-        if request.branch != meta.branch:
-            raise ApiError(ErrorCode.WORKSPACE_POLICY_VIOLATION, "Reset branch must match prepared workspace branch.", status_code=403, details={"workspace_branch": meta.branch, "request_branch": request.branch})
-        repo_dir = self.manager.repo_dir(workspace_id)
-        with self.manager.lock(workspace_id):
-            removed = await self.manager.reset_to_remote(repo_dir, request.branch, clean_untracked=request.clean_untracked)
-            head_sha = await self.manager.head_sha(repo_dir)
-        self._audit(
-            operation_id="workspaceReset",
-            owner=owner,
-            repo=repo,
-            workspace_id=workspace_id,
-            branch=request.branch,
-            head_sha_after=head_sha,
-        )
-        return WorkspaceResetResponse(workspace_id=workspace_id, branch=request.branch, head_sha=head_sha, removed_untracked_files=removed)
-
     async def sync_run_artifacts_to_workspace(
         self,
         owner: str,
@@ -1115,6 +1156,38 @@ def _path_is_excluded_from_inspection(path: str) -> bool:
     if (filename == ".env" or filename.startswith(".env.")) and filename not in _ALLOWED_ENV_READ_FILES:
         return True
     return False
+
+
+def _clip_text_to_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
+    data = text.encode("utf-8", errors="replace")
+    if len(data) <= max_bytes:
+        return text, False
+    marker = _TRUNCATION_MARKER.encode("utf-8")
+    if max_bytes <= len(marker):
+        return data[:max_bytes].decode("utf-8", errors="ignore"), True
+    clipped = data[: max_bytes - len(marker)].decode("utf-8", errors="ignore")
+    return clipped + _TRUNCATION_MARKER, True
+
+
+def _model_json_bytes(model: Any) -> int:
+    return len(model.model_dump_json().encode("utf-8"))
+
+
+def _chunk_path_args(paths: list[str], *, max_arg_bytes: int) -> list[list[str]]:
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_bytes = 0
+    for path in paths:
+        path_bytes = len(path.encode("utf-8")) + 1
+        if current and current_bytes + path_bytes > max_arg_bytes:
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+        current.append(path)
+        current_bytes += path_bytes
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _join_repo_path(parent: str, child: str) -> str:
