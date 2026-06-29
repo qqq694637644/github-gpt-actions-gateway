@@ -22,6 +22,9 @@ from app.models.workspaces import (
     WorkspaceApplyPatchRequest,
     WorkspaceCommitAndPushRequest,
     WorkspaceExecPwshRequest,
+    WorkspaceInspectRequest,
+    WorkspaceReadFilesRequest,
+    WorkspaceSearchRequest,
     WorkspaceStatusRequest,
     WorkspaceWriteFileRequest,
 )
@@ -49,6 +52,25 @@ class LocalGitHub:
 
     async def get_repository(self, owner: str, repo: str) -> dict:
         return {"default_branch": "main"}
+
+    async def get_branch_head(self, owner: str, repo: str, branch: str) -> str:
+        return git("rev-parse", f"refs/heads/{branch}", cwd=self.remote)
+
+    async def get_commit_object(self, owner: str, repo: str, sha: str) -> dict:
+        git("cat-file", "-e", f"{sha}^{{commit}}", cwd=self.remote)
+        return {"sha": sha}
+
+    async def create_ref(self, owner: str, repo: str, branch: str, sha: str) -> dict:
+        existing = subprocess.run(
+            ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+            cwd=self.remote,
+            text=True,
+            capture_output=True,
+        )
+        if existing.returncode == 0:
+            raise ApiError(ErrorCode.GITHUB_CONFLICT, "already exists", status_code=409)
+        git("update-ref", f"refs/heads/{branch}", sha, cwd=self.remote)
+        return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
 
     async def get_workflow_run(self, owner: str, repo: str, run_id: int) -> dict:
         return {
@@ -159,6 +181,26 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def rg_match_event(path: str, line_number: int, line_text: str, *, start: int = 0, match_text: str = "target_symbol") -> str:
+    return json.dumps(
+        {
+            "type": "match",
+            "data": {
+                "path": {"text": path},
+                "line_number": line_number,
+                "lines": {"text": line_text + "\n"},
+                "submatches": [
+                    {
+                        "match": {"text": match_text},
+                        "start": start,
+                        "end": start + len(match_text),
+                    }
+                ],
+            },
+        }
+    )
+
+
 def test_exec_pwsh_does_not_collect_workspace_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
@@ -214,6 +256,336 @@ def test_exec_pwsh_rejects_timeout_above_configured_safety_limit(tmp_path: Path)
     assert exc.value.error_code == ErrorCode.VALIDATION_ERROR
     assert "safety limit" in exc.value.message
     assert exc.value.suggestion is not None and "dispatch a workflow" in exc.value.suggestion
+
+
+def test_prepare_can_create_or_continue_branch_before_workspace(tmp_path: Path):
+    remote, source = make_local_repo(tmp_path)
+    service, _ = make_service(tmp_path, remote)
+    main_sha = git("rev-parse", "main", cwd=source)
+
+    prepared = run(
+        service.prepare(
+            "acme",
+            "demo",
+            PrepareWorkspaceRequest(
+                mode="create_or_prepare_branch",
+                base_ref="main",
+                branch="gpt/created-by-prepare",
+                workspace_id="ws_create_prepare",
+            ),
+        )
+    )
+
+    assert prepared.branch == "gpt/created-by-prepare"
+    assert prepared.head_sha == main_sha
+    assert prepared.branch_created is True
+    assert prepared.branch_continued is False
+    assert prepared.branch_already_exists is False
+    assert prepared.branch_base_ref == "main"
+    assert prepared.branch_base_sha == main_sha
+    assert git("rev-parse", "refs/heads/gpt/created-by-prepare", cwd=remote) == main_sha
+
+
+def test_workspace_inspect_search_and_read_files_do_not_need_pwsh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    remote, source = make_local_repo(tmp_path)
+    (source / "src").mkdir()
+    (source / "src" / "sample.py").write_text(
+        "def target_symbol():\n"
+        "    return 'needle'\n"
+        "\n"
+        "def other():\n"
+        "    return target_symbol()\n",
+        encoding="utf-8",
+    )
+    git("add", "src/sample.py", cwd=source)
+    git("commit", "-m", "Add sample source", cwd=source)
+    git("push", "origin", "gpt/task", cwd=source)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_inspect")))
+
+    monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: "rg" if name == "rg" else None)
+
+    async def fake_rg_run(args, **kwargs):
+        assert args[0] == "rg"
+        assert "--hidden" not in args
+        assert "--no-ignore" not in args
+        assert "--ignore-file" not in args
+        assert args[-1] in {"src", "."}
+        return CommandResult(
+            exit_code=0,
+            stdout="\n".join(
+                [
+                    rg_match_event("src/sample.py", 1, "def target_symbol():"),
+                    rg_match_event("src/sample.py", 5, "    return target_symbol()", start=11),
+                ]
+            )
+            + "\n",
+            stderr="",
+            duration_ms=3,
+            truncated=False,
+        )
+
+    monkeypatch.setattr(manager.git, "run", fake_rg_run)
+
+    read_response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=["src/sample.py"], max_lines=2),
+        )
+    )
+    assert read_response.files[0].content.startswith("1: def target_symbol")
+
+    search_response = run(
+        service.search(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceSearchRequest(query="target_symbol", paths=["src"], max_matches=5),
+        )
+    )
+    assert search_response.match_count >= 1
+    assert search_response.matches[0].path == "src/sample.py"
+    assert search_response.matches[0].snippet is not None
+
+    inspect_response = run(
+        service.inspect(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceInspectRequest(paths=["."], queries=["target_symbol"], max_read_files=1),
+        )
+    )
+    assert any(entry.path == "src/sample.py" for entry in inspect_response.tree)
+    assert inspect_response.searches[0].match_count >= 1
+    assert inspect_response.files[0].path == "src/sample.py"
+
+
+def test_workspace_search_requires_ripgrep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    remote, _ = make_local_repo(tmp_path)
+    service, _ = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_rg_required")))
+    monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: None)
+
+    with pytest.raises(ApiError) as exc:
+        run(
+            service.search(
+                "acme",
+                "demo",
+                prepared.workspace_id,
+                WorkspaceSearchRequest(query="anything"),
+            )
+        )
+
+    assert exc.value.error_code == ErrorCode.WORKSPACE_EXEC_FAILED
+    assert "ripgrep" in exc.value.message
+
+
+def test_workspace_search_uses_ripgrep_default_filters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_rg_defaults")))
+    monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: "rg" if name == "rg" else None)
+    captured: dict[str, list[str]] = {}
+
+    async def fake_rg_run(args, **kwargs):
+        captured["args"] = list(args)
+        return CommandResult(exit_code=1, stdout="", stderr="", duration_ms=2, truncated=False)
+
+    monkeypatch.setattr(manager.git, "run", fake_rg_run)
+
+    response = run(
+        service.search(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceSearchRequest(query="SECRET", paths=["."], max_matches=5),
+        )
+    )
+
+    assert response.match_count == 0
+    args = captured["args"]
+    assert args[0] == "rg"
+    assert "--hidden" not in args
+    assert "--no-ignore" not in args
+    assert "--ignore-file" not in args
+    assert args[-1] == "."
+
+
+def test_workspace_read_files_truncates_single_long_line_to_max_bytes(tmp_path: Path):
+    remote, source = make_local_repo(tmp_path)
+    (source / "src").mkdir()
+    (source / "src" / "long.txt").write_text("x" * 5000 + "\nsecond\n", encoding="utf-8")
+    git("add", "src/long.txt", cwd=source)
+    git("commit", "-m", "Add long line", cwd=source)
+    git("push", "origin", "gpt/task", cwd=source)
+    service, _ = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_long_line")))
+
+    response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=["src/long.txt"], max_lines=1, max_bytes_per_file=80),
+        )
+    )
+
+    file = response.files[0]
+    assert file.truncated is True
+    assert len(file.content.encode("utf-8")) <= 80
+
+
+def test_workspace_read_files_respects_total_response_budget(tmp_path: Path):
+    remote, source = make_local_repo(tmp_path)
+    (source / "docs").mkdir()
+    paths = []
+    for index in range(8):
+        path = source / "docs" / f"file-{index}.txt"
+        path.write_text(f"file {index}\n" + ("x" * 900) + "\n", encoding="utf-8")
+        paths.append(f"docs/file-{index}.txt")
+    git("add", "docs", cwd=source)
+    git("commit", "-m", "Add docs", cwd=source)
+    git("push", "origin", "gpt/task", cwd=source)
+    service, _ = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_read_budget")))
+
+    response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=paths, max_bytes_per_file=1200, max_bytes=2500),
+        )
+    )
+
+    assert len(response.model_dump_json().encode("utf-8")) <= 2500
+    assert response.truncated is True
+
+
+def test_workspace_read_files_refuses_symlink_before_resolving(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_read_symlink")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    link_path = repo_dir / "linked-readme.md"
+    try:
+        link_path.symlink_to("README.md")
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not available in this test environment: {exc}")
+
+    response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=["linked-readme.md"]),
+        )
+    )
+
+    file = response.files[0]
+    assert file.content == ""
+    assert file.error == "Workspace read operations refuse symlinks."
+    assert str(repo_dir) not in (file.error or "")
+
+
+def test_workspace_read_files_refuses_symlink_directory_component(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_read_symlink_dir")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    link_path = repo_dir / "visible-link"
+    try:
+        link_path.symlink_to(".git", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not available in this test environment: {exc}")
+
+    response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=["visible-link/config"]),
+        )
+    )
+
+    file = response.files[0]
+    assert file.content == ""
+    assert file.error == "Workspace read operations refuse symlinks."
+    assert "hidden config" not in file.content
+    assert str(repo_dir) not in (file.error or "")
+
+
+def test_workspace_inspect_refuses_symlink_directory_path(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_inspect_symlink_dir")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    link_path = repo_dir / "visible-link"
+    try:
+        link_path.symlink_to(".git", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not available in this test environment: {exc}")
+
+    with pytest.raises(ApiError) as exc:
+        run(
+            service.inspect(
+                "acme",
+                "demo",
+                prepared.workspace_id,
+                WorkspaceInspectRequest(paths=["visible-link"]),
+            )
+        )
+
+    assert exc.value.error_code == ErrorCode.WORKSPACE_POLICY_VIOLATION
+    assert exc.value.message == "Workspace inspection operations refuse symlinks."
+    assert str(repo_dir) not in str(exc.value.details)
+
+
+def test_workspace_search_and_inspect_respect_total_response_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    remote, source = make_local_repo(tmp_path)
+    (source / "src").mkdir()
+    lines = [f"def target_symbol_{idx}(): return '{'x' * 180}'" for idx in range(80)]
+    (source / "src" / "many.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    git("add", "src/many.py", cwd=source)
+    git("commit", "-m", "Add many matches", cwd=source)
+    git("push", "origin", "gpt/task", cwd=source)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_budget")))
+    monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: "rg" if name == "rg" else None)
+
+    async def fake_rg_run(args, **kwargs):
+        assert args[0] == "rg"
+        stdout = "\n".join(
+            rg_match_event("src/many.py", idx + 1, line, start=4, match_text="target_symbol")
+            for idx, line in enumerate(lines)
+        )
+        return CommandResult(exit_code=0, stdout=stdout + "\n", stderr="", duration_ms=4, truncated=False)
+
+    monkeypatch.setattr(manager.git, "run", fake_rg_run)
+
+    search_response = run(
+        service.search(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceSearchRequest(query="target_symbol", paths=["src"], max_matches=80, max_bytes=2500),
+        )
+    )
+    inspect_response = run(
+        service.inspect(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceInspectRequest(paths=["src"], queries=["target_symbol"], max_search_matches=80, max_read_files=10, max_bytes=2500),
+        )
+    )
+
+    assert len(search_response.model_dump_json().encode("utf-8")) <= 2500
+    assert search_response.truncated is True
+    assert len(inspect_response.model_dump_json().encode("utf-8")) <= 2500
+    assert inspect_response.truncated is True
 
 
 def test_sync_run_artifacts_to_workspace_downloads_and_skips_unchanged_run(tmp_path: Path):

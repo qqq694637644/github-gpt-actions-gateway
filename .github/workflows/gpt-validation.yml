@@ -1,7 +1,9 @@
 name: GPT Gateway v2 Validation
 
 on:
-  push: {}
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main

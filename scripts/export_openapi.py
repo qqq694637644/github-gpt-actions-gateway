@@ -11,14 +11,15 @@ OPENAPI_SERVER_URL = "https://estranged-evergreen-hatchet.ngrok-free.dev/github"
 
 PUBLIC_OPERATION_IDS = {
     "prepareWorkspace",
+    "workspaceInspect",
+    "workspaceSearch",
+    "workspaceReadFiles",
     "workspaceExecPwsh",
     "workspaceStatus",
     "workspaceDiff",
     "workspaceApplyPatch",
     "workspaceWriteFile",
     "workspaceCommitAndPush",
-    "workspaceReset",
-    "createWorkBranch",
     "createPullRequest",
     "getPullRequest",
     "listPullRequests",
@@ -37,8 +38,6 @@ PUBLIC_OPERATION_IDS = {
     "getRunLog",
     "listArtifacts",
     "syncRunArtifactsToWorkspace",
-    "listCaches",
-    "deleteCache",
 }
 
 def collect_operation_ids(schema: dict) -> set[str]:
@@ -58,6 +57,19 @@ def validate_public_operations(schema: dict) -> None:
         raise SystemExit(f"OpenAPI v2 operationId validation failed. extra={sorted(extra)} missing={sorted(missing)}")
 
 
+def filter_public_operations(schema: dict) -> None:
+    for path, path_item in list(schema.get("paths", {}).items()):
+        for method, operation in list(path_item.items()):
+            if method.lower() not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            if not isinstance(operation, dict):
+                continue
+            if operation.get("operationId") not in PUBLIC_OPERATION_IDS:
+                del path_item[method]
+        if not any(method.lower() in {"get", "post", "put", "patch", "delete"} for method in path_item):
+            del schema["paths"][path]
+
+
 def mark_all_operations_nonconsequential(schema: dict) -> None:
     for path_item in schema.get("paths", {}).values():
         for method, operation in path_item.items():
@@ -69,6 +81,7 @@ def main() -> None:
     from app.main import app
 
     schema = app.openapi()
+    filter_public_operations(schema)
     schema["servers"] = [{"url": OPENAPI_SERVER_URL}]
     validate_public_operations(schema)
     mark_all_operations_nonconsequential(schema)

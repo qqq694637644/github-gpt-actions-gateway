@@ -9,7 +9,6 @@ from app.auth.dependencies import require_auth
 from app.config.settings import Settings, get_settings
 from app.errors import ErrorResponse
 from app.github.client import GitHubClient
-from app.models.branches import CreateWorkBranchRequest, CreateWorkBranchResponse
 from app.models.ci import (
     CIStatusQueryRequest,
     CIStatusResponse,
@@ -65,15 +64,18 @@ from app.models.workspaces import (
     WorkspaceDiffResponse,
     WorkspaceExecPwshRequest,
     WorkspaceExecPwshResponse,
-    WorkspaceResetRequest,
-    WorkspaceResetResponse,
+    WorkspaceInspectRequest,
+    WorkspaceInspectResponse,
+    WorkspaceReadFilesRequest,
+    WorkspaceReadFilesResponse,
+    WorkspaceSearchRequest,
+    WorkspaceSearchResponse,
     WorkspaceStatusRequest,
     WorkspaceStatusResponse,
     WorkspaceWriteFileRequest,
     WorkspaceWriteFileResponse,
 )
 from app.policy.rules import Policy
-from app.services.branches import BranchService
 from app.services.ci import CIService
 from app.services.pulls import PullRequestService
 from app.services.workspaces import WorkspaceService
@@ -129,6 +131,51 @@ async def workspace_exec_pwsh(
     audit: Annotated[AuditStore, Depends(audit_store)],
 ) -> WorkspaceExecPwshResponse:
     return await WorkspaceService(github, pol, settings, manager, audit).exec_pwsh(owner, repo, workspace_id, request)
+
+
+@router.post("/workspaces/{workspace_id}/inspect", operation_id="workspaceInspect", summary="Inspect workspace tree, search matches, and related file snippets", response_model=WorkspaceInspectResponse)
+async def workspace_inspect(
+    owner: str,
+    repo: str,
+    workspace_id: str,
+    request: WorkspaceInspectRequest,
+    github: Annotated[GitHubClient, Depends(github_client)],
+    pol: Annotated[Policy, Depends(policy)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    manager: Annotated[WorkspaceManager, Depends(workspace_manager)],
+    audit: Annotated[AuditStore, Depends(audit_store)],
+) -> WorkspaceInspectResponse:
+    return await WorkspaceService(github, pol, settings, manager, audit).inspect(owner, repo, workspace_id, request)
+
+
+@router.post("/workspaces/{workspace_id}/search", operation_id="workspaceSearch", summary="Search workspace text with ripgrep without starting PowerShell", response_model=WorkspaceSearchResponse)
+async def workspace_search(
+    owner: str,
+    repo: str,
+    workspace_id: str,
+    request: WorkspaceSearchRequest,
+    github: Annotated[GitHubClient, Depends(github_client)],
+    pol: Annotated[Policy, Depends(policy)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    manager: Annotated[WorkspaceManager, Depends(workspace_manager)],
+    audit: Annotated[AuditStore, Depends(audit_store)],
+) -> WorkspaceSearchResponse:
+    return await WorkspaceService(github, pol, settings, manager, audit).search(owner, repo, workspace_id, request)
+
+
+@router.post("/workspaces/{workspace_id}/read-files", operation_id="workspaceReadFiles", summary="Read multiple UTF-8 workspace files with line numbers", response_model=WorkspaceReadFilesResponse)
+async def workspace_read_files(
+    owner: str,
+    repo: str,
+    workspace_id: str,
+    request: WorkspaceReadFilesRequest,
+    github: Annotated[GitHubClient, Depends(github_client)],
+    pol: Annotated[Policy, Depends(policy)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    manager: Annotated[WorkspaceManager, Depends(workspace_manager)],
+    audit: Annotated[AuditStore, Depends(audit_store)],
+) -> WorkspaceReadFilesResponse:
+    return await WorkspaceService(github, pol, settings, manager, audit).read_files(owner, repo, workspace_id, request)
 
 
 @router.post("/workspaces/{workspace_id}/status", operation_id="workspaceStatus", summary="Inspect workspace status", response_model=WorkspaceStatusResponse)
@@ -204,34 +251,6 @@ async def workspace_commit_and_push(
     audit: Annotated[AuditStore, Depends(audit_store)],
 ) -> WorkspaceCommitAndPushResponse:
     return await WorkspaceService(github, pol, settings, manager, audit).commit_and_push(owner, repo, workspace_id, request)
-
-
-@router.post("/workspaces/{workspace_id}/reset", operation_id="workspaceReset", summary="Reset workspace to remote head", response_model=WorkspaceResetResponse)
-async def workspace_reset(
-    owner: str,
-    repo: str,
-    workspace_id: str,
-    request: WorkspaceResetRequest,
-    github: Annotated[GitHubClient, Depends(github_client)],
-    pol: Annotated[Policy, Depends(policy)],
-    settings: Annotated[Settings, Depends(get_settings)],
-    manager: Annotated[WorkspaceManager, Depends(workspace_manager)],
-    audit: Annotated[AuditStore, Depends(audit_store)],
-) -> WorkspaceResetResponse:
-    return await WorkspaceService(github, pol, settings, manager, audit).reset(owner, repo, workspace_id, request)
-
-
-@router.post("/branches/create-work-branch", operation_id="createWorkBranch", summary="Create or continue a work branch", response_model=CreateWorkBranchResponse)
-async def create_work_branch(
-    owner: str,
-    repo: str,
-    request: CreateWorkBranchRequest,
-    github: Annotated[GitHubClient, Depends(github_client)],
-    pol: Annotated[Policy, Depends(policy)],
-    settings: Annotated[Settings, Depends(get_settings)],
-    audit: Annotated[AuditStore, Depends(audit_store)],
-) -> CreateWorkBranchResponse:
-    return await BranchService(github, pol, settings, audit).create_work_branch(owner, repo, request)
 
 
 @router.post("/pulls/create", operation_id="createPullRequest", summary="Create or reuse an open pull request", response_model=CreatePullRequestResponse)
