@@ -437,6 +437,59 @@ def test_workspace_read_files_truncates_single_long_line_to_max_bytes(tmp_path: 
     assert len(file.content.encode("utf-8")) <= 80
 
 
+def test_workspace_read_files_respects_total_response_budget(tmp_path: Path):
+    remote, source = make_local_repo(tmp_path)
+    (source / "docs").mkdir()
+    paths = []
+    for index in range(8):
+        path = source / "docs" / f"file-{index}.txt"
+        path.write_text(f"file {index}\n" + ("x" * 900) + "\n", encoding="utf-8")
+        paths.append(f"docs/file-{index}.txt")
+    git("add", "docs", cwd=source)
+    git("commit", "-m", "Add docs", cwd=source)
+    git("push", "origin", "gpt/task", cwd=source)
+    service, _ = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_read_budget")))
+
+    response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=paths, max_bytes_per_file=1200, max_bytes=2500),
+        )
+    )
+
+    assert len(response.model_dump_json().encode("utf-8")) <= 2500
+    assert response.truncated is True
+
+
+def test_workspace_read_files_refuses_symlink_before_resolving(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_read_symlink")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    link_path = repo_dir / "linked-readme.md"
+    try:
+        link_path.symlink_to("README.md")
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not available in this test environment: {exc}")
+
+    response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=["linked-readme.md"]),
+        )
+    )
+
+    file = response.files[0]
+    assert file.content == ""
+    assert file.error == "Workspace read operations refuse symlinks."
+    assert str(repo_dir) not in (file.error or "")
+
+
 def test_workspace_search_and_inspect_respect_total_response_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     remote, source = make_local_repo(tmp_path)
     (source / "src").mkdir()

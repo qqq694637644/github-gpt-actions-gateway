@@ -198,7 +198,8 @@ class WorkspaceService:
     async def read_files(self, owner: str, repo: str, workspace_id: str, request: WorkspaceReadFilesRequest) -> WorkspaceReadFilesResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
         repo_dir = self.manager.repo_dir(workspace_id)
-        max_bytes = self._bounded_output_bytes(request.max_bytes_per_file)
+        max_file_bytes = self._bounded_output_bytes(request.max_bytes_per_file)
+        max_response_bytes = self._bounded_output_bytes(request.max_bytes, minimum=_MIN_STRUCTURED_RESPONSE_BYTES)
         with self.manager.lock(workspace_id):
             files = [
                 self._read_file_content(
@@ -206,7 +207,7 @@ class WorkspaceService:
                     path,
                     start_line=request.start_line,
                     max_lines=request.max_lines,
-                    max_bytes=max_bytes,
+                    max_bytes=max_file_bytes,
                 )
                 for path in request.paths
             ]
@@ -219,11 +220,12 @@ class WorkspaceService:
             head_sha_before=meta.head_sha,
             metadata={"paths": request.paths},
         )
-        return WorkspaceReadFilesResponse(
+        response = WorkspaceReadFilesResponse(
             workspace_id=workspace_id,
             files=files,
             truncated=any(item.truncated for item in files),
         )
+        return self._fit_read_files_response(response, max_response_bytes)
 
     async def search(self, owner: str, repo: str, workspace_id: str, request: WorkspaceSearchRequest) -> WorkspaceSearchResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
@@ -451,10 +453,15 @@ class WorkspaceService:
                 raise ApiError(ErrorCode.WORKSPACE_WRITE_INVALID_PATH, "A file path is required.", status_code=400, details={"path": path})
             if _path_is_excluded_from_inspection(normalized):
                 raise ApiError(ErrorCode.WORKSPACE_POLICY_VIOLATION, "Path is excluded from workspace inspection.", status_code=403, details={"path": normalized})
-            resolved = (repo_dir / normalized).resolve(strict=False)
-            resolved.relative_to(repo_dir.resolve())
-            if resolved.is_symlink():
+            repo_root = repo_dir.resolve()
+            candidate = repo_dir / normalized
+            if candidate.is_symlink():
                 raise ApiError(ErrorCode.WORKSPACE_POLICY_VIOLATION, "Workspace read operations refuse symlinks.", status_code=403, details={"path": normalized})
+            resolved = candidate.resolve(strict=False)
+            try:
+                resolved.relative_to(repo_root)
+            except ValueError as exc:
+                raise ApiError(ErrorCode.PATH_NOT_ALLOWED, "Resolved path escapes the workspace repository.", status_code=403, details={"path": normalized}) from exc
             if not resolved.is_file():
                 raise ApiError(ErrorCode.WORKSPACE_FILE_NOT_FOUND, "Workspace file was not found.", status_code=404, details={"path": normalized})
             if self.policy.has_binary_extension(normalized):
@@ -537,6 +544,24 @@ class WorkspaceService:
                 details={"requested_max_bytes": max_bytes, "minimum_max_bytes": minimum},
             )
         return max_bytes
+
+    def _fit_read_files_response(self, response: WorkspaceReadFilesResponse, max_bytes: int) -> WorkspaceReadFilesResponse:
+        while _model_json_bytes(response) > max_bytes and response.files:
+            files = list(response.files)
+            last_file = files[-1]
+            if last_file.content:
+                files[-1] = last_file.model_copy(update={"content": "", "truncated": True})
+            else:
+                files.pop()
+            response = response.model_copy(update={"files": files, "truncated": True})
+        if _model_json_bytes(response) > max_bytes:
+            raise ApiError(
+                ErrorCode.VALIDATION_ERROR,
+                "max_bytes is too small for the workspaceReadFiles response envelope.",
+                status_code=422,
+                details={"max_bytes": max_bytes, "minimum_max_bytes": _MIN_STRUCTURED_RESPONSE_BYTES},
+            )
+        return response
 
     def _fit_search_response(self, response: WorkspaceSearchResponse, max_bytes: int) -> WorkspaceSearchResponse:
         while _model_json_bytes(response) > max_bytes and response.matches:

@@ -118,6 +118,7 @@ class WorkspaceReadFilesRequest(GatewayBaseModel):
     start_line: int = Field(default=1, ge=1)
     max_lines: int = Field(default=200, ge=1, le=5000)
     max_bytes_per_file: int | None = Field(default=None, ge=1)
+    max_bytes: int | None = Field(default=None, ge=1024, description="Maximum serialized read-files response size in bytes.")
 
 
 class WorkspaceReadFilesResponse(GatewayBaseModel):
