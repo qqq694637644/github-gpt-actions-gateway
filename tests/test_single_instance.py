@@ -29,7 +29,12 @@ class FakeKernel32:
 def test_single_instance_mutex_rejects_existing_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
     kernel32 = FakeKernel32()
     monkeypatch.setattr(single_instance, "_is_windows", lambda: True)
-    monkeypatch.setattr(single_instance.ctypes, "WinDLL", lambda *args, **kwargs: kernel32)
+    monkeypatch.setattr(
+        single_instance.ctypes,
+        "WinDLL",
+        lambda *args, **kwargs: kernel32,
+        raising=False,
+    )
     monkeypatch.setattr(single_instance.ctypes, "get_last_error", lambda: 183)
     monkeypatch.setattr(single_instance, "_mutex_handle", None)
 
@@ -44,7 +49,12 @@ def test_single_instance_mutex_rejects_existing_gateway(monkeypatch: pytest.Monk
 def test_single_instance_mutex_is_released(monkeypatch: pytest.MonkeyPatch) -> None:
     kernel32 = FakeKernel32()
     monkeypatch.setattr(single_instance, "_is_windows", lambda: True)
-    monkeypatch.setattr(single_instance.ctypes, "WinDLL", lambda *args, **kwargs: kernel32)
+    monkeypatch.setattr(
+        single_instance.ctypes,
+        "WinDLL",
+        lambda *args, **kwargs: kernel32,
+        raising=False,
+    )
     monkeypatch.setattr(single_instance.ctypes, "get_last_error", lambda: 0)
     monkeypatch.setattr(single_instance, "_mutex_handle", None)
 
