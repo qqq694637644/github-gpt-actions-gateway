@@ -4,11 +4,10 @@ from pydantic import ValidationError
 from app.config.settings import Settings
 from app.models.branches import CreateWorkBranchRequest
 from app.models.workspaces import PrepareWorkspaceRequest
-from app.workspace.ids import WORKSPACE_ID_PATTERN
 
 
 def make_settings(tmp_path, **kwargs) -> Settings:
-    return Settings(workspace_root=str(tmp_path / "w"), workspace_mirror_root=str(tmp_path / "m"), audit_db_url=f"sqlite:///{tmp_path / 'audit.db'}", **kwargs)
+    return Settings(workspace_root=str(tmp_path / "w"), workspace_operation_root=str(tmp_path / "operations"), audit_db_url=f"sqlite:///{tmp_path / 'audit.db'}", **kwargs)
 
 
 def test_workspace_python_settings_describe_current_bootstrap_surface(tmp_path):
@@ -44,11 +43,10 @@ def test_create_work_branch_request_has_current_base_ref_shape():
     assert "purpose_slug" in properties
 
 
-def test_prepare_workspace_request_workspace_id_schema_requires_ws_prefix():
+def test_prepare_workspace_request_requires_idempotency_and_has_no_workspace_id():
     schema = PrepareWorkspaceRequest.model_json_schema()
-    workspace_id = schema["properties"]["workspace_id"]
-    string_branch = next(item for item in workspace_id["anyOf"] if item.get("type") == "string")
-    assert string_branch["pattern"] == WORKSPACE_ID_PATTERN
+    assert "workspace_id" not in schema["properties"]
+    assert "idempotency_key" in schema["required"]
 
 
 @pytest.mark.parametrize(

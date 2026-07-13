@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
+import re
 import secrets
 import shlex
 import shutil
 import stat
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from app.config.settings import Settings
@@ -19,7 +21,7 @@ from app.models.common import ChangedFile
 from app.policy.rules import Policy, is_sha
 from app.workspace.git import GitRunner, attach_numstat, normalize_git_paths, parse_numstat, parse_porcelain_z
 from app.workspace.ids import WORKSPACE_ID_RE
-from app.workspace.models import MirrorPrepareStats, WorkspaceMeta, WorkspacePrepareStats, load_meta, save_meta
+from app.workspace.models import WorkspaceMeta, WorkspacePrepareStats, load_meta, save_meta
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +32,20 @@ class WorkspaceManager:
         self.github = github
         self.policy = policy
         self.root = Path(settings.workspace_root).resolve()
-        self.mirror_root = Path(settings.workspace_mirror_root).resolve()
         self.git = GitRunner(default_timeout=max(settings.workspace_default_timeout_seconds, 1))
+        self._prepare_locks: dict[str, asyncio.Lock] = {}
+        self._active_workspace_provider: Callable[[], set[str]] = set
         self.root.mkdir(parents=True, exist_ok=True)
-        self.mirror_root.mkdir(parents=True, exist_ok=True)
+
+    def set_active_workspace_provider(self, provider: Callable[[], set[str]]) -> None:
+        self._active_workspace_provider = provider
+
+    @asynccontextmanager
+    async def prepare_idempotency_lock(self, scope: str, key: str) -> AsyncIterator[None]:
+        lock_key = f"{scope}:{key}"
+        lock = self._prepare_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            yield
 
     def workspace_dir(self, workspace_id: str) -> Path:
         if not WORKSPACE_ID_RE.fullmatch(workspace_id):
@@ -47,26 +59,18 @@ class WorkspaceManager:
         workspace_dir = self.workspace_dir(workspace_id)
         if not (workspace_dir / "meta.json").exists():
             raise ApiError(ErrorCode.WORKSPACE_NOT_FOUND, "Workspace was not found.", status_code=404, details={"workspace_id": workspace_id})
-        return load_meta(workspace_dir)
+        meta = load_meta(workspace_dir)
+        try:
+            os.utime(workspace_dir, None)
+        except OSError:
+            logger.exception("workspace_touch.error workspace_id=%s path=%s", workspace_id, workspace_dir)
+        return meta
 
     @contextmanager
-    def lock(self, workspace_id: str) -> Iterator[None]:
-        workspace_dir = self.workspace_dir(workspace_id)
-        workspace_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = workspace_dir / "lock"
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
-            raise ApiError(ErrorCode.WORKSPACE_BUSY, "Workspace is locked by another operation.", status_code=409, details={"workspace_id": workspace_id}) from exc
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(str(os.getpid()))
-            yield
-        finally:
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
+    def workspace_scope(self, workspace_id: str) -> Iterator[None]:
+        """Validate the workspace path without applying workspace-wide locking."""
+        self.workspace_dir(workspace_id)
+        yield
 
     async def prepare(
         self,
@@ -76,9 +80,7 @@ class WorkspaceManager:
         branch: str | None,
         source_pr_number: int | None,
         base_ref: str | None,
-        workspace_id: str | None,
-        refresh: bool,
-        clean: bool,
+        purpose_slug: str,
     ) -> WorkspacePrepareStats:
         return await self._prepare_workspace(
             owner=owner,
@@ -86,9 +88,7 @@ class WorkspaceManager:
             branch=branch,
             source_pr_number=source_pr_number,
             base_ref=base_ref,
-            workspace_id=workspace_id,
-            refresh=refresh,
-            clean=clean,
+            purpose_slug=purpose_slug,
         )
 
 
@@ -100,9 +100,7 @@ class WorkspaceManager:
         branch: str | None,
         source_pr_number: int | None,
         base_ref: str | None,
-        workspace_id: str | None,
-        refresh: bool,
-        clean: bool,
+        purpose_slug: str,
     ) -> WorkspacePrepareStats:
         self.policy.assert_repo_allowed(owner, repo)
         selected = [branch is not None, source_pr_number is not None, base_ref is not None]
@@ -122,122 +120,73 @@ class WorkspaceManager:
                 raise ApiError(ErrorCode.GITHUB_ERROR, "PR head branch was missing from GitHub response.", status_code=502)
         writable = branch is not None
         if writable:
+            assert branch is not None
             self.policy.assert_write_branch_allowed(branch)
-            target_ref = branch
+            target_ref: str = branch
         else:
             target_ref = base_ref or default_branch
             self.policy.assert_read_ref_allowed(target_ref)
 
-        explicit_workspace_id = workspace_id is not None
         pruned_count = self.prune_expired_workspace_dirs()
         logger.warning(
-            "workspace_prune.prepare_triggered ttl_hours=%s pruned_count=%s workspace_id=%s explicit_workspace_id=%s target_ref=%s root=%s",
+            "workspace_prune.prepare_triggered ttl_hours=%s pruned_count=%s target_ref=%s root=%s",
             self.settings.workspace_ttl_hours,
             pruned_count,
-            workspace_id,
-            explicit_workspace_id,
             target_ref,
             self.root,
         )
-        if workspace_id is None:
-            self._enforce_workspace_count()
-            workspace_id = self._new_workspace_id()
+        workspace_id = self._new_workspace_id(purpose_slug)
         workspace_dir = self.workspace_dir(workspace_id)
         repo_dir = workspace_dir / "repo"
-        workspace_exists = (workspace_dir / "meta.json").exists()
-        created = not workspace_exists
-        if explicit_workspace_id and not workspace_exists:
-            self._enforce_workspace_count()
+        created = True
         start_total = time.perf_counter()
-        with self.lock(workspace_id):
-            if workspace_exists:
-                meta = load_meta(workspace_dir)
-                if meta.owner != owner or meta.repo != repo:
-                    raise ApiError(ErrorCode.WORKSPACE_POLICY_VIOLATION, "Workspace belongs to a different repository.", status_code=403)
-                if meta.branch != target_ref:
-                    raise ApiError(ErrorCode.WORKSPACE_DIRTY, "Workspace already targets a different ref; create a new workspace.", status_code=409, details={"workspace_branch": meta.branch, "requested_branch": target_ref})
-                if meta.writable != writable:
-                    raise ApiError(
-                        ErrorCode.WORKSPACE_DIRTY,
-                        "Workspace already targets this ref with a different writability mode; create a new workspace.",
-                        status_code=409,
-                        details={"workspace_writable": meta.writable, "requested_writable": writable},
-                    )
-            else:
-                workspace_dir.mkdir(parents=True, exist_ok=True)
-                meta = WorkspaceMeta(
-                    workspace_id=workspace_id,
-                    owner=owner,
-                    repo=repo,
-                    branch=target_ref,
-                    default_branch=default_branch,
-                    head_sha="",
-                    source_pr_number=source_pr_number,
-                    writable=writable,
-                )
-            mirror_stats = await self._ensure_mirror(owner, repo, refresh=refresh)
-            workspace_start = time.perf_counter()
-            if not repo_dir.exists():
+        with self.workspace_scope(workspace_id):
+            workspace_dir.mkdir(parents=True, exist_ok=False)
+            meta = WorkspaceMeta(
+                workspace_id=workspace_id,
+                owner=owner,
+                repo=repo,
+                branch=target_ref,
+                default_branch=default_branch,
+                head_sha="",
+                source_pr_number=source_pr_number,
+                writable=writable,
+            )
+            try:
+                workspace_start = time.perf_counter()
                 workspace_stage = "clone"
                 await self._clone_workspace(owner, repo, repo_dir)
-            else:
-                workspace_stage = "reuse"
-                await self._ensure_origin(owner, repo, repo_dir)
-            refreshed = bool(refresh)
-            if refreshed:
                 await self.fetch_branch(repo_dir, target_ref)
-            await self.checkout_ref(repo_dir, target_ref)
-            if clean:
-                await self.reset_to_remote(repo_dir, target_ref, clean_untracked=True)
-            if self.should_use_python_venv(writable=writable):
-                await self.ensure_python_venv(repo_dir)
-            workspace_duration_ms = round((time.perf_counter() - workspace_start) * 1000)
-            head_sha = await self.head_sha(repo_dir)
-            meta.head_sha = head_sha
-            meta.default_branch = default_branch
-            meta.source_pr_number = source_pr_number
-            meta.writable = writable
-            save_meta(workspace_dir, meta)
-            diagnostics = WorkspacePrepareStats(
-                meta=meta,
-                created=created,
-                refreshed=refreshed,
-                mirror=mirror_stats,
-                workspace_stage=workspace_stage,
-                workspace_duration_ms=workspace_duration_ms,
-                total_duration_ms=round((time.perf_counter() - start_total) * 1000),
-            )
-            return diagnostics
-
-    async def _ensure_mirror(self, owner: str, repo: str, *, refresh: bool) -> MirrorPrepareStats:
-        mirror = self._mirror_path(owner, repo)
-        mirror.parent.mkdir(parents=True, exist_ok=True)
-        remote_url = self.github.git_remote_url(owner, repo)
-        auth_config = await self.github.git_auth_config()
-        started = time.perf_counter()
-        stage = "reuse"
-        existed = mirror.exists()
-        if not mirror.exists():
-            stage = "clone"
-            await self.git.run(["git", *auth_config, "clone", "--mirror", remote_url, str(mirror)], timeout=self.settings.workspace_max_timeout_seconds)
-        elif refresh:
-            stage = "fetch"
-            await self.git.run(["git", *auth_config, "--git-dir", str(mirror), "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], timeout=self.settings.workspace_max_timeout_seconds)
-        pack_bytes, pack_files = self._mirror_stats(owner, repo)
-        return MirrorPrepareStats(
-            stage=stage,
-            duration_ms=round((time.perf_counter() - started) * 1000),
-            pack_bytes=pack_bytes,
-            pack_files=pack_files,
-            refreshed=refresh and existed,
-        )
+                await self.checkout_ref(repo_dir, target_ref)
+                if self.should_use_python_venv(writable=writable):
+                    await self.ensure_python_venv(repo_dir)
+                workspace_duration_ms = round((time.perf_counter() - workspace_start) * 1000)
+                head_sha = await self.head_sha(repo_dir)
+                meta.head_sha = head_sha
+                meta.default_branch = default_branch
+                meta.source_pr_number = source_pr_number
+                meta.writable = writable
+                save_meta(workspace_dir, meta)
+                diagnostics = WorkspacePrepareStats(
+                    meta=meta,
+                    created=created,
+                    workspace_stage=workspace_stage,
+                    workspace_duration_ms=workspace_duration_ms,
+                    total_duration_ms=round((time.perf_counter() - start_total) * 1000),
+                )
+                return diagnostics
+            except BaseException:
+                shutil.rmtree(workspace_dir, ignore_errors=True)
+                raise
 
     async def _clone_workspace(self, owner: str, repo: str, repo_dir: Path) -> None:
         if repo_dir.exists():
             shutil.rmtree(repo_dir)
-        mirror = self._mirror_path(owner, repo)
-        await self.git.run(["git", "clone", str(mirror), str(repo_dir)], timeout=self.settings.workspace_max_timeout_seconds)
-        await self._ensure_origin(owner, repo, repo_dir)
+        auth_config = await self.github.git_auth_config()
+        await self.git.run(
+            ["git", *auth_config, "clone", self.github.git_remote_url(owner, repo), str(repo_dir)],
+            timeout=self.settings.workspace_max_timeout_seconds,
+        )
         await self.git.run(["git", "config", "user.name", self.settings.workspace_git_user_name], cwd=repo_dir)
         await self.git.run(["git", "config", "user.email", self.settings.workspace_git_user_email], cwd=repo_dir)
 
@@ -504,25 +453,18 @@ class WorkspaceManager:
                 if self.policy.looks_binary(data):
                     raise ApiError(ErrorCode.BINARY_FILE_NOT_ALLOWED, "Binary file changes are not allowed in workspace commits.", status_code=403, details={"path": item.path})
 
-    def _mirror_path(self, owner: str, repo: str) -> Path:
-        return self.mirror_root / owner / f"{repo}.git"
-
-    def _mirror_stats(self, owner: str, repo: str) -> tuple[int, int]:
-        pack_dir = self._mirror_path(owner, repo) / "objects" / "pack"
-        if not pack_dir.exists():
-            return 0, 0
-        total = 0
-        count = 0
-        for item in pack_dir.glob("*.pack"):
-            try:
-                total += item.stat().st_size
-                count += 1
-            except OSError:
-                continue
-        return total, count
-
-    def _new_workspace_id(self) -> str:
-        return "ws_" + secrets.token_hex(8)
+    def _new_workspace_id(self, purpose_slug: str) -> str:
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "_", purpose_slug).strip("_-").lower()
+        slug = slug[:40] or "task"
+        for _ in range(10):
+            candidate = f"ws_{slug}_{secrets.token_hex(4)}"
+            if not (self.root / candidate).exists():
+                return candidate
+        raise ApiError(
+            ErrorCode.WORKSPACE_STORAGE_LIMIT,
+            "Unable to allocate a unique workspace id.",
+            status_code=507,
+        )
 
     def prune_expired_workspace_dirs(self) -> int:
         ttl_hours = self.settings.workspace_ttl_hours
@@ -539,8 +481,8 @@ class WorkspaceManager:
             if not item.is_dir() or not WORKSPACE_ID_RE.fullmatch(item.name):
                 logger.warning("workspace_prune.skip_invalid name=%s path=%s is_dir=%s", item.name, item, item.is_dir())
                 continue
-            if (item / "lock").exists():
-                logger.warning("workspace_prune.skip_locked workspace_id=%s path=%s", item.name, item)
+            if item.name in self._active_workspace_provider():
+                logger.warning("workspace_prune.skip_active workspace_id=%s path=%s", item.name, item)
                 continue
             try:
                 mtime = item.stat().st_mtime
@@ -571,12 +513,15 @@ class WorkspaceManager:
         logger.warning("workspace_prune.done ttl_hours=%s scanned_count=%s deleted_count=%s root=%s", ttl_hours, scanned, deleted, self.root)
         return deleted
 
-    def _enforce_workspace_count(self) -> None:
-        if self.settings.workspace_max_count <= 0:
-            raise ApiError(ErrorCode.WORKSPACE_STORAGE_LIMIT, "Workspace creation is disabled by WORKSPACE_MAX_COUNT.", status_code=507)
-        count = sum(1 for item in self.root.glob("ws_*") if item.is_dir())
-        if count >= self.settings.workspace_max_count:
-            raise ApiError(ErrorCode.WORKSPACE_STORAGE_LIMIT, "Workspace count limit reached.", status_code=507, details={"count": count, "max": self.settings.workspace_max_count})
+    def remove_legacy_lock_files(self) -> int:
+        removed = 0
+        for item in self.root.glob("ws_*/lock"):
+            try:
+                item.unlink()
+                removed += 1
+            except OSError:
+                logger.exception("workspace_lock_cleanup.error path=%s", item)
+        return removed
 
 
 def _path_is_selected(path: str, selectors: list[str]) -> bool:

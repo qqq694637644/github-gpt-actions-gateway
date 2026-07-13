@@ -7,38 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-OPENAPI_SERVER_URL = "https://estranged-evergreen-hatchet.ngrok-free.dev/github"
+from app.api.public_operations import PUBLIC_OPERATION_IDS, filter_and_mark_public_operations  # noqa: E402
 
-PUBLIC_OPERATION_IDS = {
-    "prepareWorkspace",
-    "workspaceInspect",
-    "workspaceSearch",
-    "workspaceReadFiles",
-    "workspaceExecPwsh",
-    "workspaceStatus",
-    "workspaceDiff",
-    "workspaceApplyPatch",
-    "workspaceWriteFile",
-    "workspaceCommitAndPush",
-    "createPullRequest",
-    "getPullRequest",
-    "listPullRequests",
-    "getPullRequestFiles",
-    "updatePullRequest",
-    "mergePullRequest",
-    "commentPullRequest",
-    "queryCiStatus",
-    "dispatchWorkflow",
-    "queryFailedCiLog",
-    "getCiRun",
-    "rerunWorkflowRun",
-    "getCiJobs",
-    "rerunWorkflowJob",
-    "getJobLog",
-    "getRunLog",
-    "listArtifacts",
-    "syncRunArtifactsToWorkspace",
-}
+OPENAPI_SERVER_URL = "https://estranged-evergreen-hatchet.ngrok-free.dev/github"
 
 def collect_operation_ids(schema: dict) -> set[str]:
     operation_ids: set[str] = set()
@@ -54,27 +25,17 @@ def validate_public_operations(schema: dict) -> None:
     extra = operation_ids - PUBLIC_OPERATION_IDS
     missing = PUBLIC_OPERATION_IDS - operation_ids
     if extra or missing:
-        raise SystemExit(f"OpenAPI v2 operationId validation failed. extra={sorted(extra)} missing={sorted(missing)}")
+        raise SystemExit(f"OpenAPI v3 operationId validation failed. extra={sorted(extra)} missing={sorted(missing)}")
+    if len(operation_ids) > 30:
+        raise SystemExit(f"OpenAPI operationId limit exceeded: {len(operation_ids)} > 30")
 
 
 def filter_public_operations(schema: dict) -> None:
-    for path, path_item in list(schema.get("paths", {}).items()):
-        for method, operation in list(path_item.items()):
-            if method.lower() not in {"get", "post", "put", "patch", "delete"}:
-                continue
-            if not isinstance(operation, dict):
-                continue
-            if operation.get("operationId") not in PUBLIC_OPERATION_IDS:
-                del path_item[method]
-        if not any(method.lower() in {"get", "post", "put", "patch", "delete"} for method in path_item):
-            del schema["paths"][path]
+    filter_and_mark_public_operations(schema)
 
 
 def mark_all_operations_nonconsequential(schema: dict) -> None:
-    for path_item in schema.get("paths", {}).values():
-        for method, operation in path_item.items():
-            if method.lower() in {"get", "post", "put", "patch", "delete"} and isinstance(operation, dict) and "operationId" in operation:
-                operation["x-openai-isConsequential"] = False
+    filter_and_mark_public_operations(schema)
 
 
 def main() -> None:

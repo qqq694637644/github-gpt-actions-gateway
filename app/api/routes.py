@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
 
-from app.api.deps import audit_store, github_client, policy, workspace_manager
+from app.api.deps import audit_store, github_client, policy, workspace_manager, workspace_operation_manager
 from app.auth.dependencies import require_auth
 from app.config.settings import Settings, get_settings
 from app.errors import ErrorResponse
@@ -58,12 +58,12 @@ from app.models.workspaces import (
     PrepareWorkspaceResponse,
     WorkspaceApplyPatchRequest,
     WorkspaceApplyPatchResponse,
+    WorkspaceCommandRequest,
+    WorkspaceCommandResponse,
     WorkspaceCommitAndPushRequest,
     WorkspaceCommitAndPushResponse,
     WorkspaceDiffRequest,
     WorkspaceDiffResponse,
-    WorkspaceExecPwshRequest,
-    WorkspaceExecPwshResponse,
     WorkspaceInspectRequest,
     WorkspaceInspectResponse,
     WorkspaceReadFilesRequest,
@@ -81,8 +81,9 @@ from app.services.pulls import PullRequestService
 from app.services.workspaces import WorkspaceService
 from app.storage.audit import AuditStore
 from app.workspace.manager import WorkspaceManager
+from app.workspace.operations import WorkspaceOperationManager
 
-_error_responses = {
+_error_responses: dict[int | str, dict[str, Any]] = {
     400: {"model": ErrorResponse},
     401: {"model": ErrorResponse},
     403: {"model": ErrorResponse},
@@ -98,7 +99,7 @@ _error_responses = {
 
 router = APIRouter(
     prefix="/repos/{owner}/{repo}",
-    tags=["GPT Actions Gateway v2"],
+    tags=["GPT Actions Gateway v3"],
     dependencies=[Depends(require_auth)],
     responses=_error_responses,
 )
@@ -118,19 +119,20 @@ async def prepare_workspace(
     return await WorkspaceService(github, pol, settings, manager, audit).prepare(owner, repo, request)
 
 
-@router.post("/workspaces/{workspace_id}/exec-pwsh", operation_id="workspaceExecPwsh", summary="Run controlled PowerShell in a workspace", response_model=WorkspaceExecPwshResponse)
-async def workspace_exec_pwsh(
+@router.post("/workspaces/{workspace_id}/command", operation_id="workspaceCommand", summary="Start or manage a workspace command", response_model=WorkspaceCommandResponse)
+async def workspace_command(
     owner: str,
     repo: str,
     workspace_id: str,
-    request: WorkspaceExecPwshRequest,
+    request: WorkspaceCommandRequest,
     github: Annotated[GitHubClient, Depends(github_client)],
     pol: Annotated[Policy, Depends(policy)],
     settings: Annotated[Settings, Depends(get_settings)],
     manager: Annotated[WorkspaceManager, Depends(workspace_manager)],
+    operations: Annotated[WorkspaceOperationManager, Depends(workspace_operation_manager)],
     audit: Annotated[AuditStore, Depends(audit_store)],
-) -> WorkspaceExecPwshResponse:
-    return await WorkspaceService(github, pol, settings, manager, audit).exec_pwsh(owner, repo, workspace_id, request)
+) -> WorkspaceCommandResponse:
+    return await WorkspaceService(github, pol, settings, manager, audit, operations).command(owner, repo, workspace_id, request)
 
 
 @router.post("/workspaces/{workspace_id}/inspect", operation_id="workspaceInspect", summary="Inspect workspace tree, search matches, and related file snippets", response_model=WorkspaceInspectResponse)
@@ -188,9 +190,10 @@ async def workspace_status(
     pol: Annotated[Policy, Depends(policy)],
     settings: Annotated[Settings, Depends(get_settings)],
     manager: Annotated[WorkspaceManager, Depends(workspace_manager)],
+    operations: Annotated[WorkspaceOperationManager, Depends(workspace_operation_manager)],
     audit: Annotated[AuditStore, Depends(audit_store)],
 ) -> WorkspaceStatusResponse:
-    return await WorkspaceService(github, pol, settings, manager, audit).status(owner, repo, workspace_id, request)
+    return await WorkspaceService(github, pol, settings, manager, audit, operations).status(owner, repo, workspace_id, request)
 
 
 @router.post("/workspaces/{workspace_id}/diff", operation_id="workspaceDiff", summary="Read current workspace diff", response_model=WorkspaceDiffResponse)

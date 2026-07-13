@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from collections.abc import Callable
 
 import httpx
 import pytest
@@ -55,5 +56,69 @@ async def _require_git_credentials(settings: Settings) -> None:
     client = httpx.AsyncClient()
     try:
         await provider.get_git_credentials(client)
+    finally:
+        await client.aclose()
+
+
+def test_github_get_retries_one_transient_response_and_preserves_headers() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, request=request, text="temporary")
+        return httpx.Response(200, request=request, json={"default_branch": "main"})
+
+    result = asyncio.run(_request_with_transport(handler, successful=True))
+
+    assert attempts == 2
+    assert result == {"default_branch": "main"}
+
+
+def test_github_write_does_not_retry_and_error_contains_rate_metadata() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            403,
+            request=request,
+            text="API rate limit exceeded",
+            headers={
+                "X-GitHub-Request-Id": "request-123",
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "1234567890",
+            },
+        )
+
+    with pytest.raises(ApiError) as exc:
+        asyncio.run(_request_with_transport(handler, successful=False))
+
+    assert attempts == 1
+    assert exc.value.error_code == ErrorCode.GITHUB_RATE_LIMITED
+    assert exc.value.details["github_request_id"] == "request-123"
+    assert exc.value.details["rate_limit_remaining"] == "0"
+    assert exc.value.details["rate_limit_reset"] == "1234567890"
+
+
+async def _request_with_transport(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    successful: bool,
+) -> dict:
+    settings = Settings(github_auth_mode="pat", github_token="pat-token")
+    client = GitHubClient(settings)
+    await client._client.aclose()  # noqa: SLF001 - controlled transport injection for client behavior tests
+    client._client = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://api.github.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        if successful:
+            return await client.get_repository("acme", "demo")
+        await client._request("POST", "/repos/acme/demo/git/refs", json={})  # noqa: SLF001
+        raise AssertionError("Expected GitHub request failure")
     finally:
         await client.aclose()

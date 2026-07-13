@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -21,7 +22,7 @@ class GitHubClient:
             headers={
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": settings.github_api_version,
-                "User-Agent": "gpt-actions-gateway-v2/2.0",
+                "User-Agent": "gpt-actions-gateway-v3/3.0",
             },
             follow_redirects=False,
         )
@@ -73,24 +74,45 @@ class GitHubClient:
         request_headers = {"Authorization": f"Bearer {token}"}
         if headers:
             request_headers.update(headers)
-        try:
-            response = await self._client.request(method, path, params=params, json=json, headers=request_headers, follow_redirects=follow_redirects)
-        except httpx.TimeoutException as exc:
-            raise ApiError(
-                ErrorCode.GITHUB_ERROR,
-                "GitHub API request timed out.",
-                status_code=502,
-                suggestion="Check outbound network access to GitHub, or increase REQUEST_TIMEOUT_SECONDS if the network is slow.",
-                details={"method": method, "path": path},
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise ApiError(
-                ErrorCode.GITHUB_ERROR,
-                "GitHub API request failed before receiving a valid response.",
-                status_code=502,
-                suggestion="Check outbound network access, proxy configuration, and GitHub API reachability.",
-                details={"method": method, "path": path, "error": str(exc)},
-            ) from exc
+        attempts = 2 if method.upper() == "GET" else 1
+        response: httpx.Response | None = None
+        for attempt in range(attempts):
+            try:
+                response = await self._client.request(
+                    method,
+                    path,
+                    params=params,
+                    json=json,
+                    headers=request_headers,
+                    follow_redirects=follow_redirects,
+                )
+            except httpx.TimeoutException as exc:
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.25)
+                    continue
+                raise ApiError(
+                    ErrorCode.GITHUB_ERROR,
+                    "GitHub API request timed out.",
+                    status_code=502,
+                    suggestion="Check outbound network access to GitHub, or increase REQUEST_TIMEOUT_SECONDS if the network is slow.",
+                    details={"method": method, "path": path},
+                ) from exc
+            except httpx.HTTPError as exc:
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.25)
+                    continue
+                raise ApiError(
+                    ErrorCode.GITHUB_ERROR,
+                    "GitHub API request failed before receiving a valid response.",
+                    status_code=502,
+                    suggestion="Check outbound network access, proxy configuration, and GitHub API reachability.",
+                    details={"method": method, "path": path, "error": str(exc)},
+                ) from exc
+            if response.status_code in {502, 503, 504} and attempt + 1 < attempts:
+                await asyncio.sleep(0.25)
+                continue
+            break
+        assert response is not None
         if response.status_code >= 400:
             self._raise_for_github_error(response)
         if raw_bytes:
@@ -104,7 +126,13 @@ class GitHubClient:
     def _raise_for_github_error(self, response: httpx.Response) -> None:
         status = response.status_code
         body = response.text[:4000]
-        details = {"github_status": status, "body": body}
+        details = {
+            "github_status": status,
+            "body": body,
+            "github_request_id": response.headers.get("x-github-request-id"),
+            "rate_limit_remaining": response.headers.get("x-ratelimit-remaining"),
+            "rate_limit_reset": response.headers.get("x-ratelimit-reset"),
+        }
         if status in (401, 403) and "rate limit" in body.lower():
             raise ApiError(ErrorCode.GITHUB_RATE_LIMITED, "GitHub API rate limit exceeded.", status_code=429, details=details)
         if status in (401, 403):
