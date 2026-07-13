@@ -10,9 +10,13 @@ _mutex_handle: int | None = None
 _mutex_lock = threading.Lock()
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 def acquire_single_instance() -> None:
     global _mutex_handle
-    if os.name != "nt":
+    if not _is_windows():
         return
     with _mutex_lock:
         if _mutex_handle is not None:
@@ -38,7 +42,7 @@ def acquire_single_instance() -> None:
 
 def release_single_instance() -> None:
     global _mutex_handle
-    if os.name != "nt":
+    if not _is_windows():
         return
     with _mutex_lock:
         if _mutex_handle is None:
