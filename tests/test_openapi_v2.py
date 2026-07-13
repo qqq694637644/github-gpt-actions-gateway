@@ -3,6 +3,7 @@ from scripts.export_openapi import (
     PUBLIC_OPERATION_IDS,
     collect_operation_ids,
     filter_public_operations,
+    validate_request_body_object_schemas,
 )
 
 
@@ -32,6 +33,12 @@ def test_export_marks_all_public_operations_low_risk_nonconsequential():
                 assert operation["x-openai-isConsequential"] is False
 
 
+def test_all_public_json_request_bodies_resolve_to_objects():
+    schema = app.openapi()
+    filter_public_operations(schema)
+    validate_request_body_object_schemas(schema)
+
+
 def test_prepare_schema_is_destructive_and_server_generates_workspace_id():
     schema = app.openapi()
     request_schema = schema["components"]["schemas"]["PrepareWorkspaceRequest"]
@@ -43,13 +50,18 @@ def test_prepare_schema_is_destructive_and_server_generates_workspace_id():
     assert "idempotency_key" in request_schema["required"]
 
 
-def test_workspace_command_replaces_exec_pwsh_with_discriminated_request():
+def test_workspace_command_replaces_exec_pwsh_with_action_envelope():
     schema = app.openapi()
     assert "/repos/{owner}/{repo}/workspaces/{workspace_id}/exec-pwsh" not in schema["paths"]
     operation = schema["paths"]["/repos/{owner}/{repo}/workspaces/{workspace_id}/command"]["post"]
     assert operation["operationId"] == "workspaceCommand"
     request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
-    assert request_schema["discriminator"]["propertyName"] == "action"
+    request_schema_name = request_schema["$ref"].rsplit("/", 1)[-1]
+    request_model = schema["components"]["schemas"][request_schema_name]
+    assert request_model["type"] == "object"
+    assert "oneOf" not in request_schema
+    assert request_model["properties"]["action"]["enum"] == ["start", "get", "logs", "cancel", "list"]
+    assert {"action", "idempotency_key", "script", "operation_id", "state"} <= set(request_model["properties"])
     response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
     schema_name = response_schema["$ref"].rsplit("/", 1)[-1]
     properties = schema["components"]["schemas"][schema_name]["properties"]

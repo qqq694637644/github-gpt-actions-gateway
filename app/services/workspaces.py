@@ -28,6 +28,7 @@ from app.models.workspaces import (
     WorkspaceCommandRequest,
     WorkspaceCommandResponse,
     WorkspaceCommandStartRequest,
+    WorkspaceCommandVariant,
     WorkspaceCommitAndPushRequest,
     WorkspaceCommitAndPushResponse,
     WorkspaceDiffRequest,
@@ -182,11 +183,14 @@ class WorkspaceService:
         owner: str,
         repo: str,
         workspace_id: str,
-        request: WorkspaceCommandRequest,
+        request: WorkspaceCommandRequest | WorkspaceCommandVariant,
     ) -> WorkspaceCommandResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
         if self.operations is None:
             raise ApiError(ErrorCode.WORKSPACE_EXEC_FAILED, "Workspace operation manager is unavailable.", status_code=500)
+
+        if isinstance(request, WorkspaceCommandRequest):
+            request = request.to_variant()
 
         if isinstance(request, WorkspaceCommandStartRequest):
             if request.timeout_seconds is not None and request.timeout_seconds > self.settings.workspace_max_timeout_seconds:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -103,14 +103,116 @@ class WorkspaceCommandListRequest(GatewayBaseModel):
     state: Literal["running", "succeeded", "failed", "timed_out", "canceled", "interrupted"] | None = None
 
 
-WorkspaceCommandRequest = Annotated[
+WorkspaceCommandVariant = (
     WorkspaceCommandStartRequest
     | WorkspaceCommandGetRequest
     | WorkspaceCommandLogsRequest
     | WorkspaceCommandCancelRequest
-    | WorkspaceCommandListRequest,
-    Field(discriminator="action"),
-]
+    | WorkspaceCommandListRequest
+)
+
+
+class WorkspaceCommandRequest(GatewayBaseModel):
+    """GPT Actions-compatible request envelope.
+
+    GPT Actions requires an operation request body to have an object schema at
+    the top level. A Pydantic discriminated union is emitted as a top-level
+    ``oneOf`` and is therefore skipped by the Actions schema importer. This
+    flat envelope keeps the public schema object-shaped while preserving the
+    strongly typed action-specific models used internally.
+    """
+
+    action: Literal["start", "get", "logs", "cancel", "list"] = Field(
+        description="Command action. Fields not used by the selected action are ignored."
+    )
+
+    # start
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=200,
+        description="Required when action=start.",
+    )
+    script: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=20000,
+        description="PowerShell script to run. Required when action=start.",
+    )
+    timeout_seconds: int | None = Field(default=None, ge=1, description="Optional when action=start.")
+    max_output_bytes: int | None = Field(default=None, ge=1, description="Optional when action=start.")
+    allow_network: bool = Field(default=False, description="Optional when action=start.")
+    plain_output: bool = Field(
+        default=False,
+        description="Optional when action=start. Strip ANSI escapes and prefer plain output.",
+    )
+    utf8_output: bool = Field(
+        default=True,
+        description="Optional when action=start. Use UTF-8 console and output defaults.",
+    )
+
+    # get, logs, cancel
+    operation_id: str | None = Field(
+        default=None,
+        pattern=r"^op_[0-9a-f]{16}$",
+        description="Required when action=get, logs, or cancel.",
+    )
+
+    # logs
+    stdout_offset: int = Field(default=0, ge=0, description="Optional when action=logs.")
+    stderr_offset: int = Field(default=0, ge=0, description="Optional when action=logs.")
+    max_bytes: int = Field(default=50_000, ge=1, le=500_000, description="Optional when action=logs.")
+
+    # list
+    state: Literal["running", "succeeded", "failed", "timed_out", "canceled", "interrupted"] | None = Field(
+        default=None,
+        description="Optional state filter when action=list.",
+    )
+
+    @model_validator(mode="after")
+    def validate_action_fields(self) -> WorkspaceCommandRequest:
+        if self.action == "start":
+            missing = [
+                field_name
+                for field_name, value in (("idempotency_key", self.idempotency_key), ("script", self.script))
+                if value is None
+            ]
+            if missing:
+                raise ValueError(f"action=start requires: {', '.join(missing)}")
+        elif self.action in {"get", "logs", "cancel"} and self.operation_id is None:
+            raise ValueError(f"action={self.action} requires: operation_id")
+        return self
+
+    def to_variant(self) -> WorkspaceCommandVariant:
+        if self.action == "start":
+            assert self.idempotency_key is not None
+            assert self.script is not None
+            return WorkspaceCommandStartRequest(
+                action="start",
+                idempotency_key=self.idempotency_key,
+                script=self.script,
+                timeout_seconds=self.timeout_seconds,
+                max_output_bytes=self.max_output_bytes,
+                allow_network=self.allow_network,
+                plain_output=self.plain_output,
+                utf8_output=self.utf8_output,
+            )
+        if self.action == "get":
+            assert self.operation_id is not None
+            return WorkspaceCommandGetRequest(action="get", operation_id=self.operation_id)
+        if self.action == "logs":
+            assert self.operation_id is not None
+            return WorkspaceCommandLogsRequest(
+                action="logs",
+                operation_id=self.operation_id,
+                stdout_offset=self.stdout_offset,
+                stderr_offset=self.stderr_offset,
+                max_bytes=self.max_bytes,
+            )
+        if self.action == "cancel":
+            assert self.operation_id is not None
+            return WorkspaceCommandCancelRequest(action="cancel", operation_id=self.operation_id)
+        return WorkspaceCommandListRequest(action="list", state=self.state)
 
 
 class WorkspaceOperationSummary(GatewayBaseModel):
