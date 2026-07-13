@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     workspace_command_kill_grace_seconds: int = 5
     workspace_command_reader_grace_seconds: int = 2
     workspace_command_shutdown_seconds: int = 10
+    workspace_operation_progress_flush_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
     workspace_operation_ttl_hours: int = 168
     workspace_max_output_bytes: int = Field(default=80_000)
     workspace_max_diff_bytes: int = Field(default=200_000)

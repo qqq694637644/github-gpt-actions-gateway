@@ -11,8 +11,9 @@ import pytest
 from app.config.settings import Settings
 from app.errors import ApiError, ErrorCode
 from app.models.workspaces import WorkspaceCommandStartRequest
+from app.workspace import operations as operations_module
 from app.workspace.exec import build_pwsh_script, strip_ansi_escape_sequences
-from app.workspace.operations import WorkspaceOperationManager
+from app.workspace.operations import OperationRuntime, WorkspaceOperationManager
 
 
 def run(coro):
@@ -88,6 +89,237 @@ def test_build_pwsh_script_does_not_change_default_script() -> None:
 
 def test_strip_ansi_escape_sequences_removes_display_noise() -> None:
     assert strip_ansi_escape_sequences("\x1b[32;1mMode \x1b[0mName") == "Mode Name"
+
+
+def test_job_object_creation_failure_never_starts_pwsh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        process_started = False
+
+        class BrokenJob:
+            def __init__(self) -> None:
+                raise OSError("job creation failed")
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            nonlocal process_started
+            process_started = True
+            raise AssertionError("PowerShell must not start when Job Object creation fails")
+
+        monkeypatch.setattr(operations_module, "WindowsJob", BrokenJob)
+        monkeypatch.setattr(
+            operations_module.asyncio,
+            "create_subprocess_exec",
+            fake_create_subprocess_exec,
+        )
+        manager = WorkspaceOperationManager(make_settings(tmp_path))
+        operation = await manager.start(
+            workspace_id="ws_job_failure",
+            repo_dir=repo_dir,
+            idempotency_key="command_job_failure",
+            script="Write-Output unreachable",
+            timeout_seconds=10,
+            max_output_bytes=20_000,
+            allow_network=False,
+            plain_output=True,
+            utf8_output=True,
+            activate_python_venv=False,
+            python_venv_dir=".venv",
+        )
+        terminal = await wait_terminal(
+            manager,
+            "ws_job_failure",
+            operation["operation_id"],
+        )
+        assert terminal["state"] == "failed"
+        assert terminal["error_code"] == "command_start_failed"
+        assert process_started is False
+        await manager.shutdown()
+
+    run(scenario())
+
+
+def test_finally_terminates_started_process_after_startup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        terminated: list[bool] = []
+
+        class FakeJob:
+            assigned = False
+
+            def close(self) -> None:
+                pass
+
+        class FakeProcess:
+            pid = 1234
+            returncode: int | None = None
+
+        async def create_job(runtime):
+            return FakeJob()
+
+        async def create_process(runtime, *args, **kwargs):
+            return FakeProcess()
+
+        async def fail_assignment(runtime, job, process):
+            raise RuntimeError("assignment setup failed")
+
+        async def capture_termination(process, job, grace_seconds):
+            process.returncode = -9
+            terminated.append(True)
+
+        manager = WorkspaceOperationManager(make_settings(tmp_path))
+        monkeypatch.setattr(manager, "_create_job_before_deadline", create_job)
+        monkeypatch.setattr(manager, "_create_process_before_deadline", create_process)
+        monkeypatch.setattr(manager, "_assign_job_before_deadline", fail_assignment)
+        monkeypatch.setattr(
+            operations_module,
+            "_terminate_process_tree",
+            capture_termination,
+        )
+        operation = await manager.start(
+            workspace_id="ws_finally_cleanup",
+            repo_dir=repo_dir,
+            idempotency_key="command_finally_cleanup",
+            script="Write-Output unreachable",
+            timeout_seconds=10,
+            max_output_bytes=20_000,
+            allow_network=False,
+            plain_output=True,
+            utf8_output=True,
+            activate_python_venv=False,
+            python_venv_dir=".venv",
+        )
+        terminal = await wait_terminal(
+            manager,
+            "ws_finally_cleanup",
+            operation["operation_id"],
+        )
+        assert terminal["state"] == "failed"
+        assert terminated == [True]
+        await manager.shutdown()
+
+    run(scenario())
+
+
+def test_startup_uses_remaining_end_to_end_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        process_started = False
+        closed_jobs: list[bool] = []
+
+        class SlowJob:
+            def __init__(self) -> None:
+                time.sleep(0.25)
+                self.assigned = False
+
+            def close(self) -> None:
+                closed_jobs.append(True)
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            nonlocal process_started
+            process_started = True
+            raise AssertionError("Process creation must not start after the deadline")
+
+        monkeypatch.setattr(operations_module, "WindowsJob", SlowJob)
+        monkeypatch.setattr(
+            operations_module.asyncio,
+            "create_subprocess_exec",
+            fake_create_subprocess_exec,
+        )
+        manager = WorkspaceOperationManager(make_settings(tmp_path))
+        started = time.monotonic()
+        operation = await manager.start(
+            workspace_id="ws_startup_timeout",
+            repo_dir=repo_dir,
+            idempotency_key="command_startup_timeout",
+            script="Write-Output unreachable",
+            timeout_seconds=0.05,
+            max_output_bytes=20_000,
+            allow_network=False,
+            plain_output=True,
+            utf8_output=True,
+            activate_python_venv=False,
+            python_venv_dir=".venv",
+        )
+        terminal = await wait_terminal(
+            manager,
+            "ws_startup_timeout",
+            operation["operation_id"],
+            timeout=1,
+        )
+        elapsed = time.monotonic() - started
+        assert terminal["state"] == "timed_out"
+        assert elapsed < 0.2
+        assert process_started is False
+        await asyncio.sleep(0.25)
+        assert closed_jobs == [True]
+        await manager.shutdown()
+
+    run(scenario())
+
+
+def test_progress_metadata_is_throttled_but_terminal_state_is_immediate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        manager = WorkspaceOperationManager(
+            make_settings(
+                tmp_path,
+                workspace_operation_progress_flush_seconds=60,
+            )
+        )
+        now = time.monotonic()
+        runtime = OperationRuntime(
+            record={
+                "operation_id": "op_aaaaaaaaaaaaaaaa",
+                "workspace_id": "ws_progress",
+                "state": "running",
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            },
+            started_monotonic=now,
+            deadline_monotonic=now + 60,
+            last_progress_persist_monotonic=now,
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"x" * (64 * 1024 * 8))
+        reader.feed_eof()
+        persisted: list[dict] = []
+
+        def capture_write(record: dict) -> None:
+            persisted.append(dict(record))
+
+        monkeypatch.setattr(manager, "_write_record", capture_write)
+        await manager._drain_stream(
+            runtime,
+            "stdout",
+            reader,
+            tmp_path / "stdout.log",
+            1024,
+        )
+        assert runtime.record["stdout_bytes"] == 64 * 1024 * 8
+        assert runtime.record["stdout_truncated"] is True
+        assert persisted == []
+
+        await manager._finish(runtime, state="succeeded", exit_code=0)
+        assert len(persisted) == 1
+        assert persisted[0]["state"] == "succeeded"
+
+    run(scenario())
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not available")

@@ -9,10 +9,11 @@ import secrets
 import signal
 import subprocess
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from app.config.settings import Settings
 from app.errors import ApiError, ErrorCode
@@ -35,6 +36,7 @@ _TERMINAL_STATES: set[str] = {
     "canceled",
     "interrupted",
 }
+T = TypeVar("T")
 
 
 def _utc_now() -> str:
@@ -161,9 +163,15 @@ class WindowsJob:
             self.handle = None
 
 
+class OperationDeadlineExceeded(Exception):
+    pass
+
+
 @dataclass(slots=True)
 class OperationRuntime:
     record: dict[str, Any]
+    started_monotonic: float
+    deadline_monotonic: float
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     shutdown_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -171,6 +179,7 @@ class OperationRuntime:
     process: asyncio.subprocess.Process | None = None
     job: WindowsJob | None = None
     stored_bytes: int = 0
+    last_progress_persist_monotonic: float = 0.0
 
 
 class WorkspaceOperationManager:
@@ -182,6 +191,7 @@ class WorkspaceOperationManager:
         self._records: dict[str, dict[str, Any]] = {}
         self._runtimes: dict[str, OperationRuntime] = {}
         self._idempotency: dict[tuple[str, str], str] = {}
+        self._background_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._load_records()
         if recover_running:
             self.recover_running_operations()
@@ -260,6 +270,7 @@ class WorkspaceOperationManager:
             validate_script(script, allow_network=allow_network, settings=self.settings)
 
             operation_id = "op_" + secrets.token_hex(8)
+            started_monotonic = time.monotonic()
             started_at = _utc_now()
             deadline_at = (datetime.now(UTC) + timedelta(seconds=timeout_seconds)).isoformat()
             record: dict[str, Any] = {
@@ -286,7 +297,12 @@ class WorkspaceOperationManager:
                 "plain_output": plain_output,
                 "max_output_bytes": max_output_bytes,
             }
-            runtime = OperationRuntime(record=record)
+            runtime = OperationRuntime(
+                record=record,
+                started_monotonic=started_monotonic,
+                deadline_monotonic=started_monotonic + timeout_seconds,
+                last_progress_persist_monotonic=started_monotonic,
+            )
             self._records[operation_id] = record
             self._runtimes[operation_id] = runtime
             self._idempotency[(workspace_id, idempotency_key)] = operation_id
@@ -436,6 +452,132 @@ class WorkspaceOperationManager:
             removed += 1
         return removed
 
+    @staticmethod
+    def _remaining_seconds(runtime: OperationRuntime) -> float:
+        return max(0.0, runtime.deadline_monotonic - time.monotonic())
+
+    async def _await_before_deadline(
+        self,
+        runtime: OperationRuntime,
+        awaitable: Awaitable[T],
+        *,
+        on_late_result: Callable[[asyncio.Future[T]], None] | None = None,
+    ) -> T:
+        future = asyncio.ensure_future(awaitable)
+        try:
+            remaining = self._remaining_seconds(runtime)
+            if remaining > 0:
+                done, _ = await asyncio.wait({future}, timeout=remaining)
+                if future in done:
+                    return future.result()
+        except asyncio.CancelledError:
+            if on_late_result is not None:
+                future.add_done_callback(on_late_result)
+            else:
+                future.cancel()
+            raise
+        if on_late_result is not None:
+            future.add_done_callback(on_late_result)
+        else:
+            future.cancel()
+        raise OperationDeadlineExceeded
+
+    def _track_cleanup_task(self, task: asyncio.Task[Any]) -> None:
+        self._background_cleanup_tasks.add(task)
+        task.add_done_callback(self._background_cleanup_tasks.discard)
+
+    async def _create_job_before_deadline(self, runtime: OperationRuntime) -> WindowsJob:
+        def close_late_job(future: asyncio.Future[WindowsJob]) -> None:
+            try:
+                future.result().close()
+            except BaseException:
+                pass
+
+        return await self._await_before_deadline(
+            runtime,
+            asyncio.to_thread(WindowsJob),
+            on_late_result=close_late_job,
+        )
+
+    async def _create_process_before_deadline(
+        self,
+        runtime: OperationRuntime,
+        *args: str,
+        cwd: str,
+        env: dict[str, str],
+        creationflags: int,
+        preexec_fn: Callable[[], None] | None,
+    ) -> asyncio.subprocess.Process:
+        def terminate_late_process(future: asyncio.Future[asyncio.subprocess.Process]) -> None:
+            try:
+                process = future.result()
+            except BaseException:
+                return
+            cleanup = asyncio.create_task(
+                _terminate_process_tree(
+                    process,
+                    None,
+                    self.settings.workspace_command_kill_grace_seconds,
+                )
+            )
+            self._track_cleanup_task(cleanup)
+
+        return await self._await_before_deadline(
+            runtime,
+            asyncio.create_subprocess_exec(
+                *args,
+                cwd=cwd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creationflags,
+                preexec_fn=preexec_fn,
+            ),
+            on_late_result=terminate_late_process,
+        )
+
+    async def _assign_job_before_deadline(
+        self,
+        runtime: OperationRuntime,
+        job: WindowsJob,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        def finish_late_assignment(future: asyncio.Future[None]) -> None:
+            try:
+                future.result()
+            except BaseException:
+                pass
+            job.terminate(1)
+            job.close()
+
+        try:
+            await self._await_before_deadline(
+                runtime,
+                asyncio.to_thread(job.assign, process.pid),
+                on_late_result=finish_late_assignment,
+            )
+        except (OperationDeadlineExceeded, asyncio.CancelledError):
+            runtime.job = None
+            await _terminate_process_tree(
+                process,
+                job,
+                self.settings.workspace_command_kill_grace_seconds,
+            )
+            raise
+
+    async def _persist_progress_if_due(self, runtime: OperationRuntime) -> None:
+        now = time.monotonic()
+        if (
+            now - runtime.last_progress_persist_monotonic
+            < self.settings.workspace_operation_progress_flush_seconds
+        ):
+            return
+        runtime.last_progress_persist_monotonic = now
+        try:
+            await asyncio.to_thread(self._write_record, dict(runtime.record))
+        except OSError:
+            pass
+
     async def _run(
         self,
         runtime: OperationRuntime,
@@ -451,7 +593,7 @@ class WorkspaceOperationManager:
         python_venv_dir: str,
     ) -> None:
         del allow_network
-        started_monotonic = time.monotonic()
+        started_monotonic = runtime.started_monotonic
         operation_id = str(runtime.record["operation_id"])
         ready_path = self.root / operation_id / "job.ready"
         prepared_script = build_pwsh_script(
@@ -481,22 +623,25 @@ class WorkspaceOperationManager:
         process_env = sanitized_environment()
         process_env["GATEWAY_JOB_READY_FILE"] = str(ready_path)
         try:
-            proc = await asyncio.create_subprocess_exec(
+            job = await self._create_job_before_deadline(runtime)
+            runtime.job = job
+            proc = await self._create_process_before_deadline(
+                runtime,
                 *args,
                 cwd=str(repo_dir),
                 env=process_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
                 creationflags=creationflags,
                 preexec_fn=preexec_fn,
             )
             runtime.process = proc
-            job = WindowsJob()
-            runtime.job = job
             try:
-                job.assign(proc.pid)
+                await self._assign_job_before_deadline(runtime, job, proc)
             except OSError as exc:
-                await _terminate_process_tree(proc, None, self.settings.workspace_command_kill_grace_seconds)
+                await _terminate_process_tree(
+                    proc,
+                    job,
+                    self.settings.workspace_command_kill_grace_seconds,
+                )
                 raise ApiError(
                     ErrorCode.WORKSPACE_EXEC_FAILED,
                     "Unable to attach the PowerShell process to a Windows Job Object.",
@@ -506,8 +651,12 @@ class WorkspaceOperationManager:
             async with runtime.lock:
                 runtime.record["root_pid"] = proc.pid
                 runtime.record["job_assigned"] = job.assigned
-                self._write_record(runtime.record)
-            ready_path.write_text("ready", encoding="utf-8")
+            if self._remaining_seconds(runtime) <= 0:
+                raise OperationDeadlineExceeded
+            await self._await_before_deadline(
+                runtime,
+                asyncio.to_thread(ready_path.write_text, "ready", encoding="utf-8"),
+            )
 
             stdout_task = asyncio.create_task(
                 self._drain_stream(runtime, "stdout", proc.stdout, self._stdout_path(runtime.record["operation_id"]), max_output_bytes)
@@ -516,7 +665,9 @@ class WorkspaceOperationManager:
                 self._drain_stream(runtime, "stderr", proc.stderr, self._stderr_path(runtime.record["operation_id"]), max_output_bytes)
             )
             process_task = asyncio.create_task(proc.wait())
-            timeout_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
+            timeout_task = asyncio.create_task(
+                asyncio.sleep(self._remaining_seconds(runtime))
+            )
             cancel_task = asyncio.create_task(runtime.cancel_event.wait())
             shutdown_task = asyncio.create_task(runtime.shutdown_event.wait())
             done, pending = await asyncio.wait(
@@ -572,6 +723,21 @@ class WorkspaceOperationManager:
                 error_code=error_code,
                 error_message=error_message,
             )
+        except OperationDeadlineExceeded:
+            if runtime.process is not None and runtime.process.returncode is None:
+                await _terminate_process_tree(
+                    runtime.process,
+                    runtime.job,
+                    self.settings.workspace_command_kill_grace_seconds,
+                )
+            await self._finish(
+                runtime,
+                state="timed_out",
+                exit_code=(runtime.process.returncode if runtime.process is not None else None),
+                duration_ms=round((time.monotonic() - started_monotonic) * 1000),
+                error_code="command_timeout",
+                error_message=f"Command exceeded {timeout_seconds} seconds during startup.",
+            )
         except asyncio.CancelledError:
             if runtime.process is not None:
                 await _terminate_process_tree(
@@ -596,6 +762,12 @@ class WorkspaceOperationManager:
                 error_message=(exc.message if isinstance(exc, ApiError) else str(exc)),
             )
         finally:
+            if runtime.process is not None and runtime.process.returncode is None:
+                await _terminate_process_tree(
+                    runtime.process,
+                    runtime.job,
+                    self.settings.workspace_command_kill_grace_seconds,
+                )
             try:
                 ready_path.unlink()
             except FileNotFoundError:
@@ -642,10 +814,7 @@ class WorkspaceOperationManager:
                         runtime.record[truncated_field] = True
                     if handle is None:
                         runtime.record[truncated_field] = True
-                    try:
-                        self._write_record(runtime.record)
-                    except OSError:
-                        pass
+                    await self._persist_progress_if_due(runtime)
         finally:
             if handle is not None:
                 handle.close()
@@ -671,7 +840,7 @@ class WorkspaceOperationManager:
             runtime.record["error_code"] = error_code
             runtime.record["error_message"] = error_message
             try:
-                self._write_record(runtime.record)
+                await asyncio.to_thread(self._write_record, dict(runtime.record))
             except OSError:
                 pass
 

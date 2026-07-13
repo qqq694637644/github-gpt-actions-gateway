@@ -668,6 +668,8 @@ duration
 cleanup duration
 ```
 
+Monotonic deadline 在 `workspaceCommand(action="start")` 创建 operation 时确定，必须覆盖 Job Object 创建、PowerShell 创建、Job 绑定、ready gate 和正式命令运行。每个启动阶段只使用剩余时间，不能在进程启动完成后重新获得一整段 timeout。
+
 使用 UTC 时间记录：
 
 ```text
@@ -682,7 +684,9 @@ finished_at
 
 ### 12.1 原子写入
 
-每次状态更新：
+状态转换、启动结果和终态立即原子写入。高频 stdout/stderr 字节计数先更新内存，最多每 0.5–1 秒持久化一次，避免每个输出块都执行同步 `fsync`。
+
+每次实际持久化：
 
 ```text
 写 state.json.tmp
@@ -692,6 +696,8 @@ finished_at
 ```
 
 不能直接覆盖目标 JSON。
+
+日志达到上限后仍继续 drain 并丢弃后续字节；截断后的高频输出同样不能逐块重写 `state.json`。
 
 ### 12.2 唯一终态
 
