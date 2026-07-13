@@ -35,7 +35,12 @@ def test_single_instance_mutex_rejects_existing_gateway(monkeypatch: pytest.Monk
         lambda *args, **kwargs: kernel32,
         raising=False,
     )
-    monkeypatch.setattr(single_instance.ctypes, "get_last_error", lambda: 183)
+    monkeypatch.setattr(
+        single_instance.ctypes,
+        "get_last_error",
+        lambda: 183,
+        raising=False,
+    )
     monkeypatch.setattr(single_instance, "_mutex_handle", None)
 
     with pytest.raises(ApiError) as exc:
@@ -55,7 +60,12 @@ def test_single_instance_mutex_is_released(monkeypatch: pytest.MonkeyPatch) -> N
         lambda *args, **kwargs: kernel32,
         raising=False,
     )
-    monkeypatch.setattr(single_instance.ctypes, "get_last_error", lambda: 0)
+    monkeypatch.setattr(
+        single_instance.ctypes,
+        "get_last_error",
+        lambda: 0,
+        raising=False,
+    )
     monkeypatch.setattr(single_instance, "_mutex_handle", None)
 
     single_instance.acquire_single_instance()
