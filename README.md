@@ -307,4 +307,4 @@ py -m venv .venv
 
 The export script validates the public operation ID set and marks every exported Action with `x-openai-isConsequential=false`.
 
-Every HTTP response includes `X-Gateway-Schema-Version`. The OpenAPI information block also publishes the Gateway schema and minimum prompt versions.
+Every HTTP response includes `X-Gateway-Schema-Version`. The OpenAPI information block publishes Gateway schema version 3 and minimum prompt version 3.1.

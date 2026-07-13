@@ -17,7 +17,7 @@ def test_openapi_contains_only_public_v3_operation_ids():
     assert "workspaceReset" not in PUBLIC_OPERATION_IDS
     assert "createWorkBranch" not in PUBLIC_OPERATION_IDS
     assert schema["info"]["x-gateway-schema-version"] == "3"
-    assert schema["info"]["x-minimum-prompt-version"] == "3"
+    assert schema["info"]["x-minimum-prompt-version"] == "3.1"
 
 
 def test_export_marks_all_public_operations_low_risk_nonconsequential():
