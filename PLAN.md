@@ -452,9 +452,11 @@ workspace_id → active_operation_ids[]
 
 ## 8. Workspace ID 与 Branch 策略
 
-### 8.1 服务端可生成 workspace ID
+### 8.1 Workspace ID 只能由服务端生成
 
-`prepareWorkspace` 允许省略 `workspace_id`：
+`prepareWorkspace` 请求模型彻底删除 `workspace_id` 字段。调用者不能指定、复用或覆盖 workspace ID。
+
+请求示例：
 
 ```json
 {
@@ -471,11 +473,15 @@ ws_fix_timeout_7f31c2
 
 返回值必须包含最终 workspace ID。
 
-仍允许调用者显式传入 workspace ID，用于继续已有任务。
+该规则是破坏式更新，不提供客户端显式传入 workspace ID 的兼容路径。
+
+后续操作必须使用 `prepareWorkspace` 返回的 workspace ID。继续已经创建的 workspace 时，调用者直接使用之前保存的 ID 调用 `workspaceStatus`、文件、命令、提交等 Operation，不再次调用 `prepareWorkspace`。
+
+继续已有 PR 时，调用者向 `prepareWorkspace` 提供 `source_pr_number`，由服务端为该次任务生成新的 workspace ID，并从 PR head 准备工作区。
 
 ### 8.2 新任务默认唯一
 
-新任务建议同时使用唯一 workspace 和 branch：
+服务端生成的 workspace ID 必须唯一。新任务建议同时使用唯一 branch：
 
 ```text
 workspace: ws_fix_timeout_7f31c2
@@ -843,9 +849,10 @@ minimum supported prompt version
 #### Workspace 创建
 
 ```text
-新任务优先让 prepareWorkspace 生成 workspace_id。
+prepareWorkspace 不接受 workspace_id，workspace ID 必须始终由服务端生成。
 保存返回的 workspace_id，后续操作继续使用它。
-继续已有 PR 时复用原 workspace 或 PR branch。
+继续已创建的 workspace 时直接使用保存的 workspace_id，不再次调用 prepareWorkspace。
+继续已有 PR 时传 source_pr_number，由服务端生成新的 workspace_id。
 ```
 
 #### 长命令
@@ -961,7 +968,7 @@ REMOVE_NON_GPT_PR_WORKSPACE_LIMIT_PLAN.md
 
 - 删除文件 lock；
 - 删除 mirror；
-- 增加服务端 workspace ID 生成；
+- 删除 `prepareWorkspace` 请求中的 `workspace_id`，改为服务端强制生成；
 - 保留现有专用 Git Operation 的 `expected_head_sha` 校验。
 
 ### 阶段五：删除限流并更新文档
@@ -1085,7 +1092,7 @@ workspace command 容量限制
 14. 重启不丢失 workspace 未提交修改。
 15. 删除 workspace 文件锁。
 16. 删除 mirror。
-17. 新任务支持服务端生成随机 workspace ID。
+17. `prepareWorkspace` 不接受客户端 workspace ID，所有 workspace ID 均由服务端生成。
 18. 同一远端 branch 继续使用现有 `expected_head_sha` 防止覆盖。
 19. 公开 operationId 不超过 30。
 20. 所有 Action 保持 `x-openai-isConsequential=false`。
