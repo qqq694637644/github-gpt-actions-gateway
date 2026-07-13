@@ -381,13 +381,17 @@ Operation 历史只做后台清理，不参与准入：
 运行中 operation 永不因数量被删除
 ```
 
+Workspace prune 必须先查询 operation 状态。只要某个 workspace 仍关联至少一个 `running` operation，就必须跳过该 workspace，不得按 TTL、最后访问时间或目录年龄清理。终态 operation 不阻止正常 prune。
+
 日志落盘使用每个 operation 的 `max_output_bytes`：
 
 ```text
-达到上限后停止继续写入
+达到上限后停止写入日志文件，但 reader 必须继续读取 stdout/stderr 并丢弃后续字节
 记录 stdout_truncated / stderr_truncated
 命令本身继续运行
 ```
+
+不能因为日志已达到上限就停止读取管道，否则子进程可能因 stdout/stderr 管道写满而阻塞，重新造成命令无法退出。
 
 不会因为历史记录数量拒绝新任务。
 
@@ -454,12 +458,15 @@ workspace_id → active_operation_ids[]
 
 ### 8.1 Workspace ID 只能由服务端生成
 
-`prepareWorkspace` 请求模型彻底删除 `workspace_id` 字段。调用者不能指定、复用或覆盖 workspace ID。
+`prepareWorkspace` 请求模型彻底删除 `workspace_id` 字段。调用者不能在 prepare 请求中指定、复用或覆盖 workspace ID。
+
+`prepareWorkspace` 必须要求调用者提供 `idempotency_key`。相同 key 与相同准备参数必须返回第一次创建的 workspace ID；相同 key 与不同参数必须返回 `IDEMPOTENCY_KEY_REUSED`。Workspace 目录创建、幂等映射和返回 ID 的登记必须在同一个小临界区内完成。
 
 请求示例：
 
 ```json
 {
+  "idempotency_key": "prepare_fix_timeout_7f31c2",
   "base_ref": "main",
   "purpose_slug": "fix-timeout"
 }
@@ -475,20 +482,22 @@ ws_fix_timeout_7f31c2
 
 该规则是破坏式更新，不提供客户端显式传入 workspace ID 的兼容路径。
 
-后续操作必须使用 `prepareWorkspace` 返回的 workspace ID。继续已经创建的 workspace 时，调用者直接使用之前保存的 ID 调用 `workspaceStatus`、文件、命令、提交等 Operation，不再次调用 `prepareWorkspace`。
+后续操作必须使用 `prepareWorkspace` 返回的 workspace ID。继续同一任务或同一 PR 且已保存原 workspace ID 时，调用者直接使用该 ID 调用 `workspaceStatus`、文件、命令、提交等 Operation，不再次调用 `prepareWorkspace`。
 
-继续已有 PR 时，调用者向 `prepareWorkspace` 提供 `source_pr_number`，由服务端为该次任务生成新的 workspace ID，并从 PR head 准备工作区。
+如果客户端在响应丢失后不确定 workspace 是否已创建，必须使用原 `idempotency_key` 重试 `prepareWorkspace`，由服务端返回原 workspace ID，不能换 key 重复创建。
+
+继续已有 PR 但没有可复用 workspace ID 时，调用者向 `prepareWorkspace` 提供 `source_pr_number` 和新的 `idempotency_key`，由服务端为该次任务生成新的 workspace ID，并从 PR head 准备工作区。
 
 ### 8.2 新任务默认唯一
 
-服务端生成的 workspace ID 必须唯一。新任务建议同时使用唯一 branch：
+每个新任务必须调用 `prepareWorkspace` 创建新的 workspace，不得复用其他任务的 workspace。服务端生成的 workspace ID 必须唯一。新任务建议同时使用唯一 branch：
 
 ```text
 workspace: ws_fix_timeout_7f31c2
 branch:    gpt/fix-timeout-7f31c2
 ```
 
-继续已有 PR 时才复用对应 branch。
+只有明确继续同一任务或同一 PR 时，才允许继续使用已保存的旧 workspace；继续已有 PR 时才复用对应 branch。
 
 ### 8.3 同一远端 branch 冲突
 
@@ -688,6 +697,8 @@ finished_at
 
 每个 operation 有自己的 `asyncio.Lock`。
 
+该锁只保护单个 operation 的状态转换、幂等创建结果和日志元数据更新。它不锁整个 workspace，也不阻止同一 workspace 中其他 operation 并发运行。
+
 终态转换只能发生一次：
 
 ```text
@@ -850,9 +861,20 @@ minimum supported prompt version
 
 ```text
 prepareWorkspace 不接受 workspace_id，workspace ID 必须始终由服务端生成。
+每个新任务必须使用新的 idempotency_key 调用 prepareWorkspace，获得新的 workspace。
 保存返回的 workspace_id，后续操作继续使用它。
-继续已创建的 workspace 时直接使用保存的 workspace_id，不再次调用 prepareWorkspace。
-继续已有 PR 时传 source_pr_number，由服务端生成新的 workspace_id。
+只有继续同一任务或同一 PR 时，才使用保存的旧 workspace_id。
+prepareWorkspace 响应异常时使用原 idempotency_key 重试，不能换 key 重复创建。
+继续已有 PR 且没有保存的旧 workspace_id 时，传 source_pr_number，由服务端生成新的 workspace_id。
+```
+
+#### PowerShell 使用范围
+
+```text
+workspaceCommand 中的 pwsh 主要用于测试、构建、lint、类型检查、依赖安装、诊断和复杂脚本。
+源码修改优先使用 workspaceApplyPatch 或 workspaceWriteFile。
+Git 提交、push、checkout、reset、分支和 PR 操作必须使用对应专用 Operation，不通过 pwsh 替代。
+源码阅读优先使用 workspaceInspect、workspaceSearch 和 workspaceReadFiles；当这些工具不足以表达复杂筛选、批量统计或动态分析时，可以灵活使用 pwsh 查看和分析源码。
 ```
 
 #### 长命令
@@ -949,6 +971,7 @@ REMOVE_NON_GPT_PR_WORKSPACE_LIMIT_PLAN.md
 
 - operation registry；
 - required idempotency key；
+- prepareWorkspace idempotency；
 - start/get/logs/cancel/list；
 - 同一 workspace 多 operation；
 - 重启 interrupted 恢复；
@@ -969,6 +992,7 @@ REMOVE_NON_GPT_PR_WORKSPACE_LIMIT_PLAN.md
 - 删除文件 lock；
 - 删除 mirror；
 - 删除 `prepareWorkspace` 请求中的 `workspace_id`，改为服务端强制生成；
+- prune 在 workspace 存在 running operation 时必须跳过；
 - 保留现有专用 Git Operation 的 `expected_head_sha` 校验。
 
 ### 阶段五：删除限流并更新文档
@@ -992,6 +1016,7 @@ pwsh 提前退出、Python 后代继续运行，Job Object 仍能终止后代
 pytest 启动 Node 后，cancel 终止完整树
 后代继承 stdout/stderr，不延长硬 deadline
 reader 不结束时，operation 仍进入终态
+日志达到 max_output_bytes 后继续 drain 并丢弃，不因管道写满卡住
 ```
 
 ### Operation
@@ -1005,6 +1030,18 @@ logs 支持 offset
 cancel 可重复调用
 timeout 与 cancel 竞争时只有一个终态
 状态 JSON 写入中崩溃不会留下半截 JSON
+operation 小锁只序列化状态、幂等和日志元数据，不阻止同 workspace 其他 operation
+```
+
+### Prepare 与 prune
+
+```text
+相同 prepare idempotency_key 和相同参数始终返回同一 workspace_id
+相同 prepare key 和不同参数返回 IDEMPOTENCY_KEY_REUSED
+每个新任务使用新 key 获得新 workspace
+继续同一任务时使用已保存 workspace_id
+存在 running operation 的 workspace 不会被 prune
+operation 全部终态后 workspace 可按正常 TTL 规则 prune
 ```
 
 ### Command 并发
@@ -1088,14 +1125,18 @@ workspace command 容量限制
 10. 所有 cleanup 都有最大等待时间。
 11. 不再用 `communicate()` 作为生命周期控制。
 12. Operation JSON 原子写入。
-13. Gateway 重启后 operation 变为 interrupted。
-14. 重启不丢失 workspace 未提交修改。
-15. 删除 workspace 文件锁。
-16. 删除 mirror。
-17. `prepareWorkspace` 不接受客户端 workspace ID，所有 workspace ID 均由服务端生成。
-18. 同一远端 branch 继续使用现有 `expected_head_sha` 防止覆盖。
-19. 公开 operationId 不超过 30。
-20. 所有 Action 保持 `x-openai-isConsequential=false`。
-21. `PROMPT.md`、`README.md` 和 OpenAPI 与新模型一致。
-22. 3–5 个网页版 GPT 可以同时完成维护任务。
-23. 同一 workspace 的多个命令可以默认并发运行。
+13. Operation 级小锁只保护状态转换、幂等创建和日志元数据，不锁 workspace。
+14. Gateway 重启后 operation 变为 interrupted。
+15. 重启不丢失 workspace 未提交修改。
+16. 删除 workspace 文件锁。
+17. prune 跳过仍有 running operation 的 workspace。
+18. 删除 mirror。
+19. `prepareWorkspace` 不接受客户端 workspace ID，所有 workspace ID 均由服务端生成。
+20. `prepareWorkspace` 和 `workspaceCommand start` 都必须幂等。
+21. 新任务必须创建新 workspace，只有继续同一任务或 PR 时才复用旧 workspace。
+22. 同一远端 branch 继续使用现有 `expected_head_sha` 防止覆盖。
+23. 公开 operationId 不超过 30。
+24. 所有 Action 保持 `x-openai-isConsequential=false`。
+25. `PROMPT.md`、`README.md` 和 OpenAPI 与新模型一致。
+26. 3–5 个网页版 GPT 可以同时完成维护任务。
+27. 同一 workspace 的多个命令可以默认并发运行。
