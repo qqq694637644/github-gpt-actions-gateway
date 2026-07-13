@@ -279,7 +279,17 @@ class CIService:
                     job_name=job.get("name") or str(job["id"]),
                     failed_step=failed_step,
                     error_summary=parsed.error_summary,
-                    annotations=[Annotation(**item) for item in parsed.annotations],
+                    annotations=[
+                        Annotation(
+                            line=(
+                                int(str(item["line"]))
+                                if item.get("line") is not None
+                                else None
+                            ),
+                            message=str(item.get("message") or ""),
+                        )
+                        for item in parsed.annotations
+                    ],
                     log_excerpt=parsed.log_excerpt,
                     last_lines=parsed.last_lines,
                     truncated=parsed.truncated,

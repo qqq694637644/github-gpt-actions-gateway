@@ -3,26 +3,27 @@ from scripts.export_openapi import (
     PUBLIC_OPERATION_IDS,
     collect_operation_ids,
     filter_public_operations,
-    mark_all_operations_nonconsequential,
 )
 
 
-def test_openapi_contains_only_v2_operation_ids():
+def test_openapi_contains_only_public_v3_operation_ids():
     schema = app.openapi()
     filter_public_operations(schema)
     assert collect_operation_ids(schema) == PUBLIC_OPERATION_IDS
     assert len(PUBLIC_OPERATION_IDS) == 28
+    assert len(PUBLIC_OPERATION_IDS) <= 30
     assert "listCaches" not in PUBLIC_OPERATION_IDS
     assert "deleteCache" not in PUBLIC_OPERATION_IDS
     assert "workspaceReset" not in PUBLIC_OPERATION_IDS
     assert "createWorkBranch" not in PUBLIC_OPERATION_IDS
+    assert schema["info"]["x-gateway-schema-version"] == "3"
+    assert schema["info"]["x-minimum-prompt-version"] == "3"
 
 
 def test_export_marks_all_public_operations_low_risk_nonconsequential():
     schema = app.openapi()
 
     filter_public_operations(schema)
-    mark_all_operations_nonconsequential(schema)
 
     for path_item in schema["paths"].values():
         for method, operation in path_item.items():
@@ -31,16 +32,29 @@ def test_export_marks_all_public_operations_low_risk_nonconsequential():
                 assert operation["x-openai-isConsequential"] is False
 
 
-def test_workspace_exec_pwsh_response_excludes_workspace_change_summary():
+def test_prepare_schema_is_destructive_and_server_generates_workspace_id():
     schema = app.openapi()
-    operation = schema["paths"]["/repos/{owner}/{repo}/workspaces/{workspace_id}/exec-pwsh"]["post"]
+    request_schema = schema["components"]["schemas"]["PrepareWorkspaceRequest"]
+    properties = request_schema["properties"]
+
+    assert "workspace_id" not in properties
+    assert "refresh" not in properties
+    assert "clean" not in properties
+    assert "idempotency_key" in request_schema["required"]
+
+
+def test_workspace_command_replaces_exec_pwsh_with_discriminated_request():
+    schema = app.openapi()
+    assert "/repos/{owner}/{repo}/workspaces/{workspace_id}/exec-pwsh" not in schema["paths"]
+    operation = schema["paths"]["/repos/{owner}/{repo}/workspaces/{workspace_id}/command"]["post"]
+    assert operation["operationId"] == "workspaceCommand"
+    request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    assert request_schema["discriminator"]["propertyName"] == "action"
     response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
     schema_name = response_schema["$ref"].rsplit("/", 1)[-1]
     properties = schema["components"]["schemas"][schema_name]["properties"]
 
-    assert set(properties) == {"exit_code", "stdout", "stderr", "truncated", "duration_ms"}
-    assert "changed_files" not in properties
-    assert "diff_stat" not in properties
+    assert {"action", "operation", "operations", "stdout", "stderr"} <= set(properties)
 
 
 def _schema_properties(schema: dict, path: str) -> set[str]:

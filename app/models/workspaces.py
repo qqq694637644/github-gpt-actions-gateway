@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
 from app.models.common import ChangedFile, GatewayBaseModel, IdempotentRequest
-from app.workspace.ids import WORKSPACE_ID_PATTERN
 
 
 class PrepareWorkspaceBaseRequest(IdempotentRequest):
+    idempotency_key: str = Field(min_length=8, max_length=200)
     mode: Literal["prepare_ref", "create_or_prepare_branch"] = Field(
         default="prepare_ref",
         description=(
-            "Workspace preparation mode. 'prepare_ref' preserves the existing behavior. "
+            "Workspace preparation mode. 'prepare_ref' creates a new workspace from an existing ref. "
             "'create_or_prepare_branch' creates or continues a writable branch before preparing it."
         ),
     )
@@ -22,8 +22,6 @@ class PrepareWorkspaceBaseRequest(IdempotentRequest):
     base_sha: str | None = Field(default=None, min_length=7, description="Exact commit SHA to branch from when mode is create_or_prepare_branch.")
     purpose_slug: str = Field(default="task", min_length=1, max_length=80, description="Branch-name slug used when create_or_prepare_branch needs to auto-generate a branch name.")
     continue_if_exists: bool = Field(default=True, description="Continue with an existing branch when create_or_prepare_branch finds one.")
-    workspace_id: str | None = Field(default=None, min_length=3, max_length=80, pattern=WORKSPACE_ID_PATTERN)
-
     @model_validator(mode="after")
     def validate_prepare_target(self) -> PrepareWorkspaceBaseRequest:
         if self.base_sha and self.base_ref:
@@ -42,18 +40,13 @@ class PrepareWorkspaceBaseRequest(IdempotentRequest):
 
 
 class PrepareWorkspaceRequest(PrepareWorkspaceBaseRequest):
-    refresh: bool = True
-    clean: bool = False
+    pass
 
 
 
 
 class WorkspacePrepareDiagnostics(GatewayBaseModel):
-    mirror_stage: Literal["clone", "fetch", "reuse", "skip"]
-    mirror_duration_ms: int
-    mirror_pack_bytes: int
-    mirror_pack_files: int
-    workspace_stage: Literal["clone", "reuse", "skip"]
+    workspace_stage: Literal["clone"]
     workspace_duration_ms: int
     total_duration_ms: int
 
@@ -67,7 +60,6 @@ class PrepareWorkspaceResponse(GatewayBaseModel):
     head_sha: str
     default_branch: str
     created: bool
-    refreshed: bool
     branch_created: bool | None = None
     branch_continued: bool | None = None
     branch_already_exists: bool | None = None
@@ -77,7 +69,9 @@ class PrepareWorkspaceResponse(GatewayBaseModel):
 
 
 
-class WorkspaceExecPwshRequest(GatewayBaseModel):
+class WorkspaceCommandStartRequest(GatewayBaseModel):
+    action: Literal["start"]
+    idempotency_key: str = Field(min_length=8, max_length=200)
     script: str = Field(min_length=1, max_length=20000)
     timeout_seconds: int | None = Field(default=None, ge=1)
     max_output_bytes: int | None = Field(default=None, ge=1)
@@ -86,12 +80,70 @@ class WorkspaceExecPwshRequest(GatewayBaseModel):
     utf8_output: bool = Field(default=True, description="Use UTF-8 PowerShell console/output defaults before running the script.")
 
 
-class WorkspaceExecPwshResponse(GatewayBaseModel):
-    exit_code: int
-    stdout: str
-    stderr: str
-    truncated: bool
-    duration_ms: int
+class WorkspaceCommandGetRequest(GatewayBaseModel):
+    action: Literal["get"]
+    operation_id: str = Field(pattern=r"^op_[0-9a-f]{16}$")
+
+
+class WorkspaceCommandLogsRequest(GatewayBaseModel):
+    action: Literal["logs"]
+    operation_id: str = Field(pattern=r"^op_[0-9a-f]{16}$")
+    stdout_offset: int = Field(default=0, ge=0)
+    stderr_offset: int = Field(default=0, ge=0)
+    max_bytes: int = Field(default=50_000, ge=1, le=500_000)
+
+
+class WorkspaceCommandCancelRequest(GatewayBaseModel):
+    action: Literal["cancel"]
+    operation_id: str = Field(pattern=r"^op_[0-9a-f]{16}$")
+
+
+class WorkspaceCommandListRequest(GatewayBaseModel):
+    action: Literal["list"]
+    state: Literal["running", "succeeded", "failed", "timed_out", "canceled", "interrupted"] | None = None
+
+
+WorkspaceCommandRequest = Annotated[
+    WorkspaceCommandStartRequest
+    | WorkspaceCommandGetRequest
+    | WorkspaceCommandLogsRequest
+    | WorkspaceCommandCancelRequest
+    | WorkspaceCommandListRequest,
+    Field(discriminator="action"),
+]
+
+
+class WorkspaceOperationSummary(GatewayBaseModel):
+    operation_id: str
+    workspace_id: str
+    script_sha256: str
+    script_summary: str
+    state: Literal["running", "succeeded", "failed", "timed_out", "canceled", "interrupted"]
+    root_pid: int | None = None
+    job_assigned: bool = False
+    started_at: str
+    deadline_at: str
+    finished_at: str | None = None
+    duration_ms: int = 0
+    exit_code: int | None = None
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class WorkspaceCommandResponse(GatewayBaseModel):
+    action: Literal["start", "get", "logs", "cancel", "list"]
+    operation: WorkspaceOperationSummary | None = None
+    operations: list[WorkspaceOperationSummary] = Field(default_factory=list)
+    stdout: str = ""
+    stderr: str = ""
+    next_stdout_offset: int = 0
+    next_stderr_offset: int = 0
+    stdout_eof: bool = False
+    stderr_eof: bool = False
 
 
 class WorkspaceTreeEntry(GatewayBaseModel):
@@ -199,6 +251,7 @@ class WorkspaceStatusResponse(GatewayBaseModel):
     changed_files: list[ChangedFile]
     untracked_files: list[str]
     conflicts: list[str]
+    active_operations: list[WorkspaceOperationSummary] = Field(default_factory=list)
 
 
 class WorkspaceDiffRequest(GatewayBaseModel):

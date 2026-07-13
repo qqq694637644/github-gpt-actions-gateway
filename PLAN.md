@@ -806,11 +806,9 @@ mirror tests
 ```text
 prepare new workspace
 → git clone repository workspace/repo
-
-prepare existing workspace
-→ git fetch origin
-→ 按模式 checkout / refresh
 ```
+
+`prepareWorkspace` 不更新、清理或重置已存在 workspace。继续同一任务时，调用者直接使用之前保存的 workspace ID 调用其他 Operation。
 
 3–5 个 GPT 同时 prepare 时，各自操作独立目录，不共享 Git object store。
 

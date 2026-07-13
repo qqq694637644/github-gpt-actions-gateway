@@ -10,7 +10,7 @@ def settings(tmp_path):
     return Settings(
         allow_all_repos=True,
         workspace_root=str(tmp_path / "workspaces"),
-        workspace_mirror_root=str(tmp_path / "mirrors"),
+        workspace_operation_root=str(tmp_path / "operations"),
         audit_db_url=f"sqlite:///{tmp_path / 'audit.db'}",
     )
 

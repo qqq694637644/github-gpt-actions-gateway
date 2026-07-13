@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import itertools
 import json
 import os
 import stat
@@ -21,7 +22,6 @@ from app.models.workspaces import (
     PrepareWorkspaceRequest,
     WorkspaceApplyPatchRequest,
     WorkspaceCommitAndPushRequest,
-    WorkspaceExecPwshRequest,
     WorkspaceInspectRequest,
     WorkspaceReadFilesRequest,
     WorkspaceSearchRequest,
@@ -33,6 +33,8 @@ from app.services.workspaces import WorkspaceService
 from app.storage.audit import AuditStore
 from app.workspace.manager import WorkspaceManager, split_command
 from app.workspace.models import CommandResult
+
+_prepare_counter = itertools.count()
 
 
 class LocalGitHub:
@@ -152,7 +154,6 @@ def make_service(
     *,
     allow_all_repos: bool = True,
     allowed_repos: str = "",
-    workspace_max_count: int = 50,
     workspace_ttl_hours: int = 48,
     workspace_python_venv_enabled: bool = False,
     workspace_python_venv_python: str | None = None,
@@ -161,10 +162,9 @@ def make_service(
         allow_all_repos=allow_all_repos,
         allowed_repos=allowed_repos,
         workspace_root=str(tmp_path / "workspaces"),
-        workspace_mirror_root=str(tmp_path / "mirrors"),
+        workspace_operation_root=str(tmp_path / "operations"),
         audit_db_url=f"sqlite:///{tmp_path / 'audit.db'}",
         allow_workflow_edit=True,
-        workspace_max_count=workspace_max_count,
         workspace_ttl_hours=workspace_ttl_hours,
         workspace_python_venv_enabled=workspace_python_venv_enabled,
         workspace_python_venv_python=workspace_python_venv_python or sys.executable,
@@ -179,6 +179,12 @@ def make_service(
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def prepare_request(**kwargs) -> PrepareWorkspaceRequest:
+    kwargs.pop("workspace_id", None)
+    kwargs.setdefault("idempotency_key", f"prepare_{next(_prepare_counter):08d}")
+    return PrepareWorkspaceRequest(**kwargs)
 
 
 def rg_match_event(path: str, line_number: int, line_text: str, *, start: int = 0, match_text: str = "target_symbol") -> str:
@@ -201,63 +207,6 @@ def rg_match_event(path: str, line_number: int, line_text: str, *, start: int = 
     )
 
 
-def test_exec_pwsh_does_not_collect_workspace_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    remote, _ = make_local_repo(tmp_path)
-    service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_exec_fast")))
-
-    async def fail_changed_files(*args, **kwargs):
-        raise AssertionError("workspaceExecPwsh must not call changed_files")
-
-    async def fail_diff_stat(*args, **kwargs):
-        raise AssertionError("workspaceExecPwsh must not call diff_stat")
-
-    class FakeExecutor:
-        async def execute(self, *args, **kwargs):
-            return CommandResult(exit_code=0, stdout="ok\n", stderr="", duration_ms=7, truncated=False)
-
-    monkeypatch.setattr(manager, "changed_files", fail_changed_files)
-    monkeypatch.setattr(manager, "diff_stat", fail_diff_stat)
-    service.executor = FakeExecutor()  # type: ignore[assignment]
-
-    response = run(
-        service.exec_pwsh(
-            "acme",
-            "demo",
-            prepared.workspace_id,
-            WorkspaceExecPwshRequest(script="Write-Output ok"),
-        )
-    )
-
-    assert response.model_dump() == {
-        "exit_code": 0,
-        "stdout": "ok\n",
-        "stderr": "",
-        "truncated": False,
-        "duration_ms": 7,
-    }
-
-
-def test_exec_pwsh_rejects_timeout_above_configured_safety_limit(tmp_path: Path):
-    remote, _ = make_local_repo(tmp_path)
-    service, _ = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_exec_timeout")))
-
-    with pytest.raises(ApiError) as exc:
-        run(
-            service.exec_pwsh(
-                "acme",
-                "demo",
-                prepared.workspace_id,
-                WorkspaceExecPwshRequest(script="Write-Output ok", timeout_seconds=service.settings.workspace_max_timeout_seconds + 1),
-            )
-        )
-
-    assert exc.value.error_code == ErrorCode.VALIDATION_ERROR
-    assert "safety limit" in exc.value.message
-    assert exc.value.suggestion is not None and "dispatch a workflow" in exc.value.suggestion
-
-
 def test_prepare_can_create_or_continue_branch_before_workspace(tmp_path: Path):
     remote, source = make_local_repo(tmp_path)
     service, _ = make_service(tmp_path, remote)
@@ -267,7 +216,7 @@ def test_prepare_can_create_or_continue_branch_before_workspace(tmp_path: Path):
         service.prepare(
             "acme",
             "demo",
-            PrepareWorkspaceRequest(
+            prepare_request(
                 mode="create_or_prepare_branch",
                 base_ref="main",
                 branch="gpt/created-by-prepare",
@@ -286,6 +235,32 @@ def test_prepare_can_create_or_continue_branch_before_workspace(tmp_path: Path):
     assert git("rev-parse", "refs/heads/gpt/created-by-prepare", cwd=remote) == main_sha
 
 
+def test_prepare_is_idempotent_and_does_not_duplicate_workspace(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    request = PrepareWorkspaceRequest(idempotency_key="prepare_same_request", branch="gpt/task")
+
+    first = run(service.prepare("acme", "demo", request))
+    second = run(service.prepare("acme", "demo", request))
+
+    assert second.workspace_id == first.workspace_id
+    assert len(list(manager.root.glob("ws_*"))) == 1
+
+    with pytest.raises(ApiError) as exc:
+        run(
+            service.prepare(
+                "acme",
+                "demo",
+                PrepareWorkspaceRequest(
+                    idempotency_key="prepare_same_request",
+                    branch="feature/task",
+                ),
+            )
+        )
+
+    assert exc.value.error_code == ErrorCode.IDEMPOTENCY_KEY_REUSED
+
+
 def test_workspace_inspect_search_and_read_files_do_not_need_pwsh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     remote, source = make_local_repo(tmp_path)
     (source / "src").mkdir()
@@ -301,7 +276,7 @@ def test_workspace_inspect_search_and_read_files_do_not_need_pwsh(tmp_path: Path
     git("commit", "-m", "Add sample source", cwd=source)
     git("push", "origin", "gpt/task", cwd=source)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_inspect")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_inspect")))
 
     monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: "rg" if name == "rg" else None)
 
@@ -365,7 +340,7 @@ def test_workspace_inspect_search_and_read_files_do_not_need_pwsh(tmp_path: Path
 def test_workspace_search_requires_ripgrep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     remote, _ = make_local_repo(tmp_path)
     service, _ = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_rg_required")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_rg_required")))
     monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: None)
 
     with pytest.raises(ApiError) as exc:
@@ -385,7 +360,7 @@ def test_workspace_search_requires_ripgrep(tmp_path: Path, monkeypatch: pytest.M
 def test_workspace_search_uses_ripgrep_default_filters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_rg_defaults")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_rg_defaults")))
     monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: "rg" if name == "rg" else None)
     captured: dict[str, list[str]] = {}
 
@@ -421,7 +396,7 @@ def test_workspace_read_files_truncates_single_long_line_to_max_bytes(tmp_path: 
     git("commit", "-m", "Add long line", cwd=source)
     git("push", "origin", "gpt/task", cwd=source)
     service, _ = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_long_line")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_long_line")))
 
     response = run(
         service.read_files(
@@ -449,7 +424,7 @@ def test_workspace_read_files_respects_total_response_budget(tmp_path: Path):
     git("commit", "-m", "Add docs", cwd=source)
     git("push", "origin", "gpt/task", cwd=source)
     service, _ = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_read_budget")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_read_budget")))
 
     response = run(
         service.read_files(
@@ -467,7 +442,7 @@ def test_workspace_read_files_respects_total_response_budget(tmp_path: Path):
 def test_workspace_read_files_refuses_symlink_before_resolving(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_read_symlink")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_read_symlink")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     link_path = repo_dir / "linked-readme.md"
     try:
@@ -493,7 +468,7 @@ def test_workspace_read_files_refuses_symlink_before_resolving(tmp_path: Path):
 def test_workspace_read_files_refuses_symlink_directory_component(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_read_symlink_dir")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_read_symlink_dir")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     link_path = repo_dir / "visible-link"
     try:
@@ -520,7 +495,7 @@ def test_workspace_read_files_refuses_symlink_directory_component(tmp_path: Path
 def test_workspace_inspect_refuses_symlink_directory_path(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_inspect_symlink_dir")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_inspect_symlink_dir")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     link_path = repo_dir / "visible-link"
     try:
@@ -552,7 +527,7 @@ def test_workspace_search_and_inspect_respect_total_response_budget(tmp_path: Pa
     git("commit", "-m", "Add many matches", cwd=source)
     git("push", "origin", "gpt/task", cwd=source)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_budget")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_budget")))
     monkeypatch.setattr("app.services.workspaces.shutil.which", lambda name: "rg" if name == "rg" else None)
 
     async def fake_rg_run(args, **kwargs):
@@ -591,7 +566,7 @@ def test_workspace_search_and_inspect_respect_total_response_budget(tmp_path: Pa
 def test_sync_run_artifacts_to_workspace_downloads_and_skips_unchanged_run(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_artifacts")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_artifacts")))
     github = service.github  # type: ignore[attr-defined]
 
     first = run(
@@ -640,7 +615,7 @@ def test_sync_run_artifacts_to_workspace_downloads_and_skips_unchanged_run(tmp_p
 def test_sync_run_artifacts_to_workspace_replaces_target_when_digest_changes(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_artifacts_replace")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_artifacts_replace")))
     github = service.github  # type: ignore[attr-defined]
 
     first = run(
@@ -675,7 +650,7 @@ def test_sync_run_artifacts_to_workspace_replaces_target_when_digest_changes(tmp
 def test_sync_run_artifacts_to_workspace_requires_artifact_digest(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, _ = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_artifacts_no_digest")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_artifacts_no_digest")))
     service.github.artifact_digest = None  # type: ignore[attr-defined]
 
     with pytest.raises(ApiError) as exc:
@@ -699,7 +674,7 @@ def test_sync_run_artifacts_to_workspace_requires_artifact_digest(tmp_path: Path
 def test_sync_run_artifacts_to_workspace_rejects_unsupported_digest_format(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, _ = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_artifacts_bad_digest")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_artifacts_bad_digest")))
     service.github.artifact_digest = "sha256:not-hex"  # type: ignore[attr-defined]
 
     with pytest.raises(ApiError) as exc:
@@ -719,7 +694,7 @@ def test_sync_run_artifacts_to_workspace_rejects_unsupported_digest_format(tmp_p
 def test_sync_run_artifacts_to_workspace_rejects_digest_mismatch(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, _ = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_artifacts_digest_mismatch")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_artifacts_digest_mismatch")))
     service.github.artifact_digest = artifact_digest(b"different archive bytes")  # type: ignore[attr-defined]
 
     with pytest.raises(ApiError) as exc:
@@ -740,7 +715,7 @@ def test_workspace_commit_and_push_updates_local_remote(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     (repo_dir / "README.md").write_text("after\n", encoding="utf-8")
 
@@ -764,7 +739,7 @@ def test_workspace_prepare_commit_and_push_allows_arbitrary_branch(tmp_path: Pat
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="feature/task")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="feature/task")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     (repo_dir / "README.md").write_text("after feature\n", encoding="utf-8")
 
@@ -789,7 +764,7 @@ def test_workspace_commit_and_push_recovers_after_commit_succeeds_but_push_fails
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_push_recovery")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_push_recovery")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     (repo_dir / "README.md").write_text("after\n", encoding="utf-8")
     original_remote_head = git("rev-parse", "gpt/task", cwd=remote)
@@ -821,35 +796,36 @@ def test_workspace_commit_and_push_recovers_after_commit_succeeds_but_push_fails
     assert git("rev-parse", "gpt/task", cwd=remote) == response.new_head_sha
 
 
-def test_workspace_prepare_explicit_ws_id_reports_created_true(tmp_path: Path):
+def test_workspace_prepare_ignores_legacy_helper_id_and_generates_server_id(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, _ = make_service(tmp_path, remote)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_custom_1")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_custom_1")))
 
-    assert prepared.workspace_id == "ws_custom_1"
+    assert prepared.workspace_id.startswith("ws_")
+    assert prepared.workspace_id != "ws_custom_1"
     assert prepared.created is True
-    assert prepared.diagnostics.mirror_stage in {"clone", "fetch"}
-    assert prepared.diagnostics.total_duration_ms >= prepared.diagnostics.mirror_duration_ms
+    assert prepared.diagnostics.workspace_stage == "clone"
+    assert prepared.diagnostics.total_duration_ms >= prepared.diagnostics.workspace_duration_ms
 
 
-def test_workspace_prepare_prunes_expired_workspace_before_count_limit(tmp_path: Path):
+def test_workspace_prepare_prunes_expired_workspace(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
-    service, manager = make_service(tmp_path, remote, workspace_max_count=1, workspace_ttl_hours=48)
+    service, manager = make_service(tmp_path, remote, workspace_ttl_hours=48)
     expired = manager.workspace_dir("ws_expired")
     expired.mkdir(parents=True)
     old = time.time() - 49 * 60 * 60
     os.utime(expired, (old, old))
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_new")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_new")))
 
-    assert prepared.workspace_id == "ws_new"
+    assert prepared.workspace_id.startswith("ws_")
     assert not expired.exists()
 
 
 def test_workspace_prune_removes_readonly_git_objects(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
-    _, manager = make_service(tmp_path, remote, workspace_max_count=3, workspace_ttl_hours=48)
+    _, manager = make_service(tmp_path, remote, workspace_ttl_hours=48)
     expired = manager.workspace_dir("ws_expired_readonly")
     object_dir = expired / "repo" / ".git" / "objects" / "00"
     object_dir.mkdir(parents=True)
@@ -867,45 +843,54 @@ def test_workspace_prune_removes_readonly_git_objects(tmp_path: Path):
             readonly_object.chmod(stat.S_IREAD | stat.S_IWRITE)
 
 
-def test_workspace_prepare_keeps_fresh_and_locked_workspace_dirs(tmp_path: Path):
+def test_workspace_prepare_keeps_fresh_and_active_workspace_dirs(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
-    service, manager = make_service(tmp_path, remote, workspace_max_count=3, workspace_ttl_hours=48)
+    service, manager = make_service(tmp_path, remote, workspace_ttl_hours=48)
     fresh = manager.workspace_dir("ws_fresh")
-    locked = manager.workspace_dir("ws_locked")
+    active = manager.workspace_dir("ws_active")
     fresh.mkdir(parents=True)
-    locked.mkdir(parents=True)
-    (locked / "lock").write_text("busy", encoding="utf-8")
+    active.mkdir(parents=True)
     old = time.time() - 49 * 60 * 60
-    os.utime(locked, (old, old))
+    os.utime(active, (old, old))
+    manager.set_active_workspace_provider(lambda: {"ws_active"})
 
-    run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_new")))
+    run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_new")))
 
     assert fresh.exists()
-    assert locked.exists()
+    assert active.exists()
 
 
-def test_workspace_prune_ignores_non_workspace_dirs_and_mirrors(tmp_path: Path):
+def test_workspace_prune_ignores_non_workspace_dirs(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
-    _, manager = make_service(tmp_path, remote, workspace_max_count=3, workspace_ttl_hours=48)
+    _, manager = make_service(tmp_path, remote, workspace_ttl_hours=48)
     non_workspace = manager.root / "cache"
-    mirror_dir = manager.mirror_root / "acme" / "demo.git"
     non_workspace.mkdir(parents=True)
-    mirror_dir.mkdir(parents=True)
     old = time.time() - 49 * 60 * 60
     os.utime(non_workspace, (old, old))
-    os.utime(mirror_dir, (old, old))
 
     assert manager.prune_expired_workspace_dirs() == 0
 
     assert non_workspace.exists()
-    assert mirror_dir.exists()
+
+
+def test_legacy_workspace_lock_cleanup_is_explicit_and_non_persistent(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    _, manager = make_service(tmp_path, remote)
+    workspace_dir = manager.workspace_dir("ws_legacy_lock")
+    workspace_dir.mkdir(parents=True)
+    lock_path = workspace_dir / "lock"
+    lock_path.write_text("old-pid", encoding="utf-8")
+
+    assert manager.remove_legacy_lock_files() == 1
+    assert not lock_path.exists()
+    assert manager.remove_legacy_lock_files() == 0
 
 
 def test_prepare_work_branch_bootstraps_python_venv_without_committable_diff(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote, workspace_python_venv_enabled=True, workspace_python_venv_python=sys.executable)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_python")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_python")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
 
     assert (repo_dir / ".venv" / "pyvenv.cfg").exists()
@@ -920,7 +905,7 @@ def test_prepare_arbitrary_branch_bootstraps_python_venv_without_prefix_check(tm
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote, workspace_python_venv_enabled=True, workspace_python_venv_python=sys.executable)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="feature/task", workspace_id="ws_python_feature")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="feature/task", workspace_id="ws_python_feature")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
 
     assert prepared.branch == "feature/task"
@@ -934,7 +919,7 @@ def test_prepare_base_ref_does_not_bootstrap_python_venv(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote, workspace_python_venv_enabled=True, workspace_python_venv_python=sys.executable)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(base_ref="main", workspace_id="ws_read_only")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(base_ref="main", workspace_id="ws_read_only")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
 
     assert not (repo_dir / ".venv").exists()
@@ -945,7 +930,7 @@ def test_prepare_arbitrary_base_ref_is_read_only_and_does_not_bootstrap_python_v
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote, workspace_python_venv_enabled=True, workspace_python_venv_python=sys.executable)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(base_ref="feature/task", workspace_id="ws_read_only_feature")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(base_ref="feature/task", workspace_id="ws_read_only_feature")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     (repo_dir / "README.md").write_text("read-only change\n", encoding="utf-8")
 
@@ -970,7 +955,7 @@ def test_legacy_workspace_meta_missing_writable_is_rejected(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(base_ref="feature/task", workspace_id="ws_legacy_meta")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(base_ref="feature/task", workspace_id="ws_legacy_meta")))
     meta_file = manager.workspace_dir(prepared.workspace_id) / "meta.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8"))
     assert meta.pop("writable") is False
@@ -998,7 +983,7 @@ def test_prepare_python_venv_does_not_modify_tracked_gitignore_or_create_status_
     git("push", "origin", "gpt/task", cwd=source)
     service, manager = make_service(tmp_path, remote, workspace_python_venv_enabled=True, workspace_python_venv_python=sys.executable)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_python_no_diff")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_python_no_diff")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
 
     assert (repo_dir / ".gitignore").read_text(encoding="utf-8") == "dist/\n"
@@ -1013,16 +998,13 @@ def test_prepare_python_venv_does_not_modify_tracked_gitignore_or_create_status_
 def test_prepare_existing_broken_python_venv_fails(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote, workspace_python_venv_enabled=False, workspace_python_venv_python=sys.executable)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_broken_python")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_broken_python")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     broken_venv = repo_dir / ".venv"
     broken_venv.mkdir()
     (broken_venv / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
-    service.settings.workspace_python_venv_enabled = True
-    manager.settings.workspace_python_venv_enabled = True
-
     with pytest.raises(ApiError) as exc:
-        run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_broken_python")))
+        run(manager.validate_python_venv(repo_dir))
 
     assert exc.value.error_code == ErrorCode.WORKSPACE_POLICY_VIOLATION
     assert "interpreter directory is missing" in exc.value.message
@@ -1031,14 +1013,11 @@ def test_prepare_existing_broken_python_venv_fails(tmp_path: Path):
 def test_prepare_existing_python_venv_without_pyvenv_cfg_fails(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote, workspace_python_venv_enabled=False, workspace_python_venv_python=sys.executable)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_missing_pyvenv_cfg")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task", workspace_id="ws_missing_pyvenv_cfg")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     (repo_dir / ".venv").mkdir()
-    service.settings.workspace_python_venv_enabled = True
-    manager.settings.workspace_python_venv_enabled = True
-
     with pytest.raises(ApiError) as exc:
-        run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task", workspace_id="ws_missing_pyvenv_cfg")))
+        run(manager.validate_python_venv(repo_dir))
 
     assert exc.value.error_code == ErrorCode.WORKSPACE_POLICY_VIOLATION
     assert "pyvenv.cfg is missing" in exc.value.message
@@ -1055,7 +1034,7 @@ def test_workspace_apply_patch_dry_run_and_apply_do_not_push(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
 
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     original_remote_head = git("rev-parse", "gpt/task", cwd=remote)
     patch = "*** Begin Patch\n*** Update File: README.md\n@@\n-before\n+after\n*** End Patch\n"
@@ -1075,7 +1054,7 @@ def test_workspace_apply_patch_dry_run_and_apply_do_not_push(tmp_path: Path):
 def test_workspace_apply_patch_rejects_delete_by_default(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, _ = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
     patch = "*** Begin Patch\n*** Delete File: README.md\n*** End Patch\n"
 
     with pytest.raises(ApiError) as exc:
@@ -1086,7 +1065,7 @@ def test_workspace_apply_patch_rejects_delete_by_default(tmp_path: Path):
 def test_workspace_apply_patch_context_mismatch_leaves_file_unchanged(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     patch = "*** Begin Patch\n*** Update File: README.md\n@@\n-missing\n+after\n*** End Patch\n"
 
@@ -1099,7 +1078,7 @@ def test_workspace_apply_patch_context_mismatch_leaves_file_unchanged(tmp_path: 
 def test_workspace_write_file_create_only_and_sha_guard(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, manager = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
     repo_dir = manager.repo_dir(prepared.workspace_id)
     original_remote_head = git("rev-parse", "gpt/task", cwd=remote)
 
@@ -1147,8 +1126,9 @@ def test_workspace_write_file_create_only_and_sha_guard(tmp_path: Path):
 def test_workspace_write_file_rejects_sensitive_path(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, _ = make_service(tmp_path, remote)
-    prepared = run(service.prepare("acme", "demo", PrepareWorkspaceRequest(branch="gpt/task")))
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
 
     with pytest.raises(ApiError) as exc:
         run(service.write_file("acme", "demo", prepared.workspace_id, WorkspaceWriteFileRequest(path=".env", content="SECRET=x\n")))
     assert exc.value.error_code == ErrorCode.WORKSPACE_POLICY_VIOLATION
+

@@ -16,6 +16,7 @@ async def test_privacy_page_returns_placeholder_content() -> None:
         response = await client.get("/privacy")
 
     assert response.status_code == 200
+    assert response.headers["X-Gateway-Schema-Version"] == "3"
     assert "text/html" in response.headers["content-type"]
     assert "隐私政策" in response.text
     assert "占位页面" in response.text

@@ -6,6 +6,7 @@ from app.github.client import GitHubClient
 from app.policy.rules import Policy
 from app.storage.audit import AuditStore
 from app.workspace.manager import WorkspaceManager
+from app.workspace.operations import WorkspaceOperationManager
 
 
 def github_client(request: Request) -> GitHubClient:
@@ -22,3 +23,7 @@ def audit_store(request: Request) -> AuditStore:
 
 def workspace_manager(request: Request) -> WorkspaceManager:
     return request.app.state.workspace_manager
+
+
+def workspace_operation_manager(request: Request) -> WorkspaceOperationManager:
+    return request.app.state.workspace_operation_manager

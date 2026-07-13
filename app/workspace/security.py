@@ -14,8 +14,8 @@ BLOCKED_ALWAYS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bgh\s+secret\b", re.IGNORECASE), "GitHub secret operations are not allowed."),
     (re.compile(r"\bGet-ChildItem\s+Env:", re.IGNORECASE), "Enumerating process environment variables is not allowed."),
     (re.compile(r"\bGet-Content\s+\$env:", re.IGNORECASE), "Reading environment variables as files is not allowed."),
-    (re.compile(r"\bssh\b", re.IGNORECASE), "ssh is not allowed from workspaceExecPwsh."),
-    (re.compile(r"\bscp\b", re.IGNORECASE), "scp is not allowed from workspaceExecPwsh."),
+    (re.compile(r"\bssh\b", re.IGNORECASE), "ssh is not allowed from workspaceCommand."),
+    (re.compile(r"\bscp\b", re.IGNORECASE), "scp is not allowed from workspaceCommand."),
 ]
 
 NETWORK_BLOCKED: list[tuple[re.Pattern[str], str]] = [

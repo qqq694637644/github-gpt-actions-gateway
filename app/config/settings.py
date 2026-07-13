@@ -73,16 +73,19 @@ class Settings(BaseSettings):
     max_blob_read_bytes: int = Field(default=2 * 1024 * 1024)
 
     workspace_root: str = "./data/workspaces"
-    workspace_mirror_root: str = "./data/mirrors"
+    workspace_operation_root: str = "./data/operations"
     workspace_default_timeout_seconds: int = 60
     workspace_max_timeout_seconds: int = 300
+    workspace_command_kill_grace_seconds: int = 5
+    workspace_command_reader_grace_seconds: int = 2
+    workspace_command_shutdown_seconds: int = 10
+    workspace_operation_ttl_hours: int = 168
     workspace_max_output_bytes: int = Field(default=80_000)
     workspace_max_diff_bytes: int = Field(default=200_000)
     workspace_max_patch_bytes: int = Field(default=200_000)
     workspace_max_write_bytes: int = Field(default=200_000)
     workspace_max_changed_files: int = 200
     workspace_ttl_hours: int = 48
-    workspace_max_count: int = 50
     workspace_allow_network: bool = False
     workspace_shell: str = "pwsh"
     workspace_git_user_name: str = "gpt-actions-gateway"
@@ -93,7 +96,6 @@ class Settings(BaseSettings):
     workspace_python_auto_gitignore: bool = True
     workspace_python_auto_activate: bool = True
 
-    rate_limit_per_minute: int = 60
     audit_db_url: str = "sqlite:///./data/audit.db"
     request_timeout_seconds: float = 30.0
 

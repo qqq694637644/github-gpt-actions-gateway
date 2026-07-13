@@ -70,20 +70,9 @@ class CommandResult(BaseModel):
 
 
 @dataclass(slots=True)
-class MirrorPrepareStats:
-    stage: str
-    duration_ms: int
-    pack_bytes: int
-    pack_files: int
-    refreshed: bool
-
-
-@dataclass(slots=True)
 class WorkspacePrepareStats:
     meta: WorkspaceMeta
     created: bool
-    refreshed: bool
-    mirror: MirrorPrepareStats
     workspace_stage: str
     workspace_duration_ms: int
     total_duration_ms: int

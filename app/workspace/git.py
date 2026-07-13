@@ -34,7 +34,7 @@ class GitRunner:
         proc_env = sanitized_environment()
         if env:
             proc_env.update(env)
-        preexec_fn = os.setsid if os.name != "nt" else None
+        preexec_fn = getattr(os, "setsid", None) if os.name != "nt" else None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -48,20 +48,40 @@ class GitRunner:
         except FileNotFoundError as exc:
             raise ApiError(ErrorCode.WORKSPACE_EXEC_FAILED, f"Executable not found: {args[0]}", status_code=500) from exc
 
-        timed_out = False
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(input_data), timeout=timeout or self.default_timeout)
-        except TimeoutError as exc:
-            timed_out = True
+        if input_data is not None and proc.stdin is not None:
+            proc.stdin.write(input_data)
+            await proc.stdin.drain()
+            proc.stdin.close()
+
+        stdout_task = asyncio.create_task(_drain_bounded(proc.stdout, max_output_bytes))
+        stderr_task = asyncio.create_task(_drain_bounded(proc.stderr, max_output_bytes))
+        wait_task = asyncio.create_task(proc.wait())
+        timeout_task = asyncio.create_task(asyncio.sleep(timeout or self.default_timeout))
+        done, _ = await asyncio.wait({wait_task, timeout_task}, return_when=asyncio.FIRST_COMPLETED)
+        timed_out = timeout_task in done and wait_task not in done
+        if timed_out:
             await kill_process_tree(proc)
-            stdout_b, stderr_b = await proc.communicate()
+            _, wait_pending = await asyncio.wait({wait_task}, timeout=5)
+            if wait_pending:
+                wait_task.cancel()
+        else:
+            timeout_task.cancel()
+        reader_done, reader_pending = await asyncio.wait(
+            {stdout_task, stderr_task},
+            timeout=2,
+        )
+        for task in reader_pending:
+            task.cancel()
+        stdout_b = stdout_task.result() if stdout_task in reader_done and not stdout_task.cancelled() else b""
+        stderr_b = stderr_task.result() if stderr_task in reader_done and not stderr_task.cancelled() else b""
+        if timed_out:
             result = _decode_result(proc.returncode or -9, stdout_b, stderr_b, started, max_output_bytes, timed_out=True)
             raise ApiError(
                 ErrorCode.WORKSPACE_TIMEOUT,
                 "Command timed out and was terminated.",
                 status_code=408,
                 details={"args": _redact_args(args), "timeout_seconds": timeout or self.default_timeout, "stdout": result.stdout, "stderr": result.stderr},
-            ) from exc
+            )
 
         result = _decode_result(proc.returncode or 0, stdout_b, stderr_b, started, max_output_bytes, timed_out=timed_out)
         allowed = set(allowed_exit_codes)
@@ -80,11 +100,48 @@ async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
         return
     if os.name != "nt":
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            killpg = getattr(os, "killpg", None)
+            getpgid = getattr(os, "getpgid", None)
+            if callable(killpg) and callable(getpgid):
+                killpg(getpgid(proc.pid), getattr(signal, "SIGKILL", 9))
         except ProcessLookupError:
             return
     else:
-        proc.kill()
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(proc.pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            killer_task = asyncio.create_task(killer.wait())
+            _, killer_pending = await asyncio.wait({killer_task}, timeout=5)
+            if killer_pending:
+                killer.kill()
+                killer_task.cancel()
+        except FileNotFoundError:
+            pass
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+
+async def _drain_bounded(stream: asyncio.StreamReader | None, max_bytes: int) -> bytes:
+    if stream is None:
+        return b""
+    collected = bytearray()
+    while True:
+        chunk = await stream.read(64 * 1024)
+        if not chunk:
+            return bytes(collected)
+        remaining = max(0, max_bytes - len(collected))
+        if remaining:
+            collected.extend(chunk[:remaining])
 
 
 def _decode_result(exit_code: int, stdout_b: bytes, stderr_b: bytes, started: float, max_output_bytes: int, *, timed_out: bool) -> CommandResult:

@@ -7,7 +7,6 @@ import os
 import re
 import shutil
 import zipfile
-from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -22,16 +21,22 @@ from app.models.workspaces import (
     PrepareWorkspaceResponse,
     WorkspaceApplyPatchRequest,
     WorkspaceApplyPatchResponse,
+    WorkspaceCommandCancelRequest,
+    WorkspaceCommandGetRequest,
+    WorkspaceCommandListRequest,
+    WorkspaceCommandLogsRequest,
+    WorkspaceCommandRequest,
+    WorkspaceCommandResponse,
+    WorkspaceCommandStartRequest,
     WorkspaceCommitAndPushRequest,
     WorkspaceCommitAndPushResponse,
     WorkspaceDiffRequest,
     WorkspaceDiffResponse,
-    WorkspaceExecPwshRequest,
-    WorkspaceExecPwshResponse,
     WorkspaceFileContent,
     WorkspaceInspectRequest,
     WorkspaceInspectResponse,
     WorkspaceInspectSearchResult,
+    WorkspaceOperationSummary,
     WorkspacePrepareDiagnostics,
     WorkspaceReadFilesRequest,
     WorkspaceReadFilesResponse,
@@ -47,8 +52,8 @@ from app.models.workspaces import (
 from app.policy.rules import Policy
 from app.services.branches import BranchService
 from app.storage.audit import AuditStore, canonical_hash
-from app.workspace.exec import PwshExecutor
 from app.workspace.manager import WorkspaceManager, command_hash
+from app.workspace.operations import WorkspaceOperationManager
 from app.workspace.text_ops import (
     apply_text_patch,
     assert_payload_size,
@@ -86,86 +91,126 @@ _TRUNCATION_MARKER = "\n...[truncated]"
 
 
 class WorkspaceService:
-    def __init__(self, github: GitHubClient, policy: Policy, settings: Settings, manager: WorkspaceManager, audit: AuditStore) -> None:
+    def __init__(
+        self,
+        github: GitHubClient,
+        policy: Policy,
+        settings: Settings,
+        manager: WorkspaceManager,
+        audit: AuditStore,
+        operations: WorkspaceOperationManager | None = None,
+    ) -> None:
         self.github = github
         self.policy = policy
         self.settings = settings
         self.manager = manager
         self.audit = audit
-        self.executor = PwshExecutor(settings)
+        self.operations = operations
 
     async def prepare(self, owner: str, repo: str, request: PrepareWorkspaceRequest) -> PrepareWorkspaceResponse:
-        branch_result: CreateWorkBranchResponse | None = None
-        branch = request.branch
-        base_ref = request.base_ref
-        source_pr_number = request.source_pr_number
-
-        if request.mode == "create_or_prepare_branch":
-            branch_result = await BranchService(self.github, self.policy, self.settings, self.audit).create_work_branch(
-                owner,
-                repo,
-                CreateWorkBranchRequest(
-                    idempotency_key=request.idempotency_key,
-                    base_ref=request.base_ref,
-                    base_sha=request.base_sha,
-                    branch=request.branch,
-                    purpose_slug=request.purpose_slug,
-                    continue_if_exists=request.continue_if_exists,
-                ),
+        scope = f"{owner}/{repo}:prepare_workspace"
+        payload = request.model_dump()
+        async with self.manager.prepare_idempotency_lock(scope, request.idempotency_key):
+            cached = self.audit.get_idempotent_response(
+                scope=scope,
+                key=request.idempotency_key,
+                request_payload=payload,
             )
-            branch = branch_result.branch
-            base_ref = None
-            source_pr_number = None
+            if cached:
+                return PrepareWorkspaceResponse(**cached)
 
-        result = await self.manager.prepare(
-            owner=owner,
-            repo=repo,
-            branch=branch,
-            source_pr_number=source_pr_number,
-            base_ref=base_ref,
-            workspace_id=request.workspace_id,
-            refresh=request.refresh,
-            clean=request.clean,
-        )
-        self._audit(
-            operation_id="prepareWorkspace",
-            owner=owner,
-            repo=repo,
-            workspace_id=result.meta.workspace_id,
-            branch=result.meta.branch,
-            head_sha_after=result.meta.head_sha,
-            metadata=self._prepare_metadata(result),
-        )
-        response = self._response_from_prepare_result(owner, repo, result)
-        if branch_result is not None:
-            response = response.model_copy(
-                update={
-                    "branch_created": branch_result.created,
-                    "branch_continued": branch_result.continued,
-                    "branch_already_exists": branch_result.already_exists,
-                    "branch_base_ref": branch_result.base_ref,
-                    "branch_base_sha": branch_result.base_sha,
-                }
+            branch_result: CreateWorkBranchResponse | None = None
+            branch = request.branch
+            base_ref = request.base_ref
+            source_pr_number = request.source_pr_number
+
+            if request.mode == "create_or_prepare_branch":
+                branch_result = await BranchService(self.github, self.policy, self.settings, self.audit).create_work_branch(
+                    owner,
+                    repo,
+                    CreateWorkBranchRequest(
+                        idempotency_key=request.idempotency_key,
+                        base_ref=request.base_ref,
+                        base_sha=request.base_sha,
+                        branch=request.branch,
+                        purpose_slug=request.purpose_slug,
+                        continue_if_exists=request.continue_if_exists,
+                    ),
+                )
+                branch = branch_result.branch
+                base_ref = None
+                source_pr_number = None
+
+            result = await self.manager.prepare(
+                owner=owner,
+                repo=repo,
+                branch=branch,
+                source_pr_number=source_pr_number,
+                base_ref=base_ref,
+                purpose_slug=request.purpose_slug,
             )
-        return response
+            self._audit(
+                operation_id="prepareWorkspace",
+                owner=owner,
+                repo=repo,
+                workspace_id=result.meta.workspace_id,
+                branch=result.meta.branch,
+                head_sha_after=result.meta.head_sha,
+                metadata=self._prepare_metadata(result),
+            )
+            response = self._response_from_prepare_result(owner, repo, result)
+            if branch_result is not None:
+                response = response.model_copy(
+                    update={
+                        "branch_created": branch_result.created,
+                        "branch_continued": branch_result.continued,
+                        "branch_already_exists": branch_result.already_exists,
+                        "branch_base_ref": branch_result.base_ref,
+                        "branch_base_sha": branch_result.base_sha,
+                    }
+                )
+            self.audit.save_idempotent_response(
+                scope=scope,
+                key=request.idempotency_key,
+                request_payload=payload,
+                response_payload=response.model_dump(),
+            )
+            return response
 
-
-    async def exec_pwsh(self, owner: str, repo: str, workspace_id: str, request: WorkspaceExecPwshRequest) -> WorkspaceExecPwshResponse:
+    async def command(
+        self,
+        owner: str,
+        repo: str,
+        workspace_id: str,
+        request: WorkspaceCommandRequest,
+    ) -> WorkspaceCommandResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
-        if request.timeout_seconds is not None and request.timeout_seconds > self.settings.workspace_max_timeout_seconds:
-            raise ApiError(
-                ErrorCode.VALIDATION_ERROR,
-                "workspaceExecPwsh timeout_seconds exceeds the configured GPT Actions safety limit.",
-                status_code=422,
-                suggestion="Use a shorter timeout, split the work into smaller commands, or dispatch a workflow and inspect CI logs/artifacts.",
-                details={"requested_timeout_seconds": request.timeout_seconds, "max_timeout_seconds": self.settings.workspace_max_timeout_seconds},
+        if self.operations is None:
+            raise ApiError(ErrorCode.WORKSPACE_EXEC_FAILED, "Workspace operation manager is unavailable.", status_code=500)
+
+        if isinstance(request, WorkspaceCommandStartRequest):
+            if request.timeout_seconds is not None and request.timeout_seconds > self.settings.workspace_max_timeout_seconds:
+                raise ApiError(
+                    ErrorCode.VALIDATION_ERROR,
+                    "workspaceCommand timeout_seconds exceeds the configured limit.",
+                    status_code=422,
+                    details={
+                        "requested_timeout_seconds": request.timeout_seconds,
+                        "max_timeout_seconds": self.settings.workspace_max_timeout_seconds,
+                    },
+                )
+            timeout = min(
+                request.timeout_seconds or self.settings.workspace_default_timeout_seconds,
+                self.settings.workspace_max_timeout_seconds,
             )
-        timeout = min(request.timeout_seconds or self.settings.workspace_default_timeout_seconds, self.settings.workspace_max_timeout_seconds)
-        max_output = min(request.max_output_bytes or self.settings.workspace_max_output_bytes, self.settings.workspace_max_output_bytes)
-        repo_dir = self.manager.repo_dir(workspace_id)
-        with self.manager.lock(workspace_id):
-            result = await self.executor.execute(
-                repo_dir,
+            max_output = min(
+                request.max_output_bytes or self.settings.workspace_max_output_bytes,
+                self.settings.workspace_max_output_bytes,
+            )
+            record = await self.operations.start(
+                workspace_id=workspace_id,
+                repo_dir=self.manager.repo_dir(workspace_id),
+                idempotency_key=request.idempotency_key,
                 script=request.script,
                 timeout_seconds=timeout,
                 max_output_bytes=max_output,
@@ -176,31 +221,49 @@ class WorkspaceService:
                 and self.manager.should_use_python_venv(writable=meta.writable),
                 python_venv_dir=self.settings.workspace_python_venv_dir,
             )
-        self._audit(
-            operation_id="workspaceExecPwsh",
-            owner=owner,
-            repo=repo,
-            workspace_id=workspace_id,
-            branch=meta.branch,
-            head_sha_before=meta.head_sha,
-            command_hash=command_hash(request.script),
-            exit_code=result.exit_code,
-            duration_ms=result.duration_ms,
-        )
-        return WorkspaceExecPwshResponse(
-            exit_code=result.exit_code,
-            stdout=result.stdout,
-            stderr=result.stderr,
-            truncated=result.truncated,
-            duration_ms=result.duration_ms,
-        )
+            self._audit(
+                operation_id="workspaceCommand",
+                owner=owner,
+                repo=repo,
+                workspace_id=workspace_id,
+                branch=meta.branch,
+                head_sha_before=meta.head_sha,
+                command_hash=command_hash(request.script),
+                metadata={"command_operation_id": record["operation_id"], "action": "start"},
+            )
+            return WorkspaceCommandResponse(
+                action="start",
+                operation=WorkspaceOperationSummary(**record),
+            )
+        if isinstance(request, WorkspaceCommandGetRequest):
+            record = await self.operations.get(workspace_id, request.operation_id)
+            return WorkspaceCommandResponse(action="get", operation=WorkspaceOperationSummary(**record))
+        if isinstance(request, WorkspaceCommandCancelRequest):
+            record = await self.operations.cancel(workspace_id, request.operation_id)
+            return WorkspaceCommandResponse(action="cancel", operation=WorkspaceOperationSummary(**record))
+        if isinstance(request, WorkspaceCommandListRequest):
+            records = await self.operations.list_operations(workspace_id, request.state)
+            return WorkspaceCommandResponse(
+                action="list",
+                operations=[WorkspaceOperationSummary(**item) for item in records],
+            )
+        if isinstance(request, WorkspaceCommandLogsRequest):
+            logs = await self.operations.logs(
+                workspace_id,
+                request.operation_id,
+                stdout_offset=request.stdout_offset,
+                stderr_offset=request.stderr_offset,
+                max_bytes=request.max_bytes,
+            )
+            return WorkspaceCommandResponse(action="logs", **logs)
+        raise ApiError(ErrorCode.VALIDATION_ERROR, "Unknown workspaceCommand action.", status_code=422)
 
     async def read_files(self, owner: str, repo: str, workspace_id: str, request: WorkspaceReadFilesRequest) -> WorkspaceReadFilesResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
         repo_dir = self.manager.repo_dir(workspace_id)
         max_file_bytes = self._bounded_output_bytes(request.max_bytes_per_file)
         max_response_bytes = self._bounded_output_bytes(request.max_bytes, minimum=_MIN_STRUCTURED_RESPONSE_BYTES)
-        with self.manager.lock(workspace_id):
+        with self.manager.workspace_scope(workspace_id):
             files = [
                 self._read_file_content(
                     repo_dir,
@@ -230,7 +293,7 @@ class WorkspaceService:
     async def search(self, owner: str, repo: str, workspace_id: str, request: WorkspaceSearchRequest) -> WorkspaceSearchResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
         repo_dir = self.manager.repo_dir(workspace_id)
-        with self.manager.lock(workspace_id):
+        with self.manager.workspace_scope(workspace_id):
             response = await self._search_workspace(workspace_id, repo_dir, request)
         self._audit(
             operation_id="workspaceSearch",
@@ -249,7 +312,7 @@ class WorkspaceService:
         repo_dir = self.manager.repo_dir(workspace_id)
         max_file_bytes = self._bounded_output_bytes(request.max_bytes_per_file)
         max_response_bytes = self._bounded_output_bytes(request.max_bytes, minimum=_MIN_STRUCTURED_RESPONSE_BYTES)
-        with self.manager.lock(workspace_id):
+        with self.manager.workspace_scope(workspace_id):
             tree, tree_truncated = self._tree_entries(
                 repo_dir,
                 request.paths,
@@ -630,7 +693,7 @@ class WorkspaceService:
     async def status(self, owner: str, repo: str, workspace_id: str, request: WorkspaceStatusRequest) -> WorkspaceStatusResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
         repo_dir = self.manager.repo_dir(workspace_id)
-        with self.manager.lock(workspace_id):
+        with self.manager.workspace_scope(workspace_id):
             if request.refresh:
                 await self.manager.fetch_branch(repo_dir, meta.branch)
             head_sha = await self.manager.head_sha(repo_dir)
@@ -648,13 +711,21 @@ class WorkspaceService:
             changed_files=changed,
             untracked_files=untracked,
             conflicts=conflicts,
+            active_operations=(
+                [
+                    WorkspaceOperationSummary(**item)
+                    for item in self.operations.active_for_workspace(workspace_id)
+                ]
+                if self.operations is not None
+                else []
+            ),
         )
 
     async def diff(self, owner: str, repo: str, workspace_id: str, request: WorkspaceDiffRequest) -> WorkspaceDiffResponse:
         meta = self._assert_workspace(owner, repo, workspace_id)
         repo_dir = self.manager.repo_dir(workspace_id)
         max_bytes = min(request.max_bytes or self.settings.workspace_max_diff_bytes, self.settings.workspace_max_diff_bytes)
-        with self.manager.lock(workspace_id):
+        with self.manager.workspace_scope(workspace_id):
             diff_text, truncated = await self.manager.diff_text(repo_dir, paths=request.paths, stat_only=request.stat_only, max_bytes=max_bytes)
             diff_stat = diff_text if request.stat_only else await self.manager.diff_stat(repo_dir)
         self._audit(
@@ -674,7 +745,7 @@ class WorkspaceService:
         assert_payload_size(patch_bytes, max_bytes=max_patch_bytes, error_code=ErrorCode.WORKSPACE_PATCH_TOO_LARGE, label="Patch")
         max_changed_files = min(request.max_changed_files or self.settings.workspace_max_changed_files, self.settings.workspace_max_changed_files)
         repo_dir = self.manager.repo_dir(workspace_id)
-        with self.manager.lock(workspace_id):
+        with self.manager.workspace_scope(workspace_id):
             operations = parse_codex_patch(request.patch, self.policy, repo_dir, allow_delete=request.allow_delete, max_changed_files=max_changed_files)
             target_paths = list(dict.fromkeys(item.path for item in operations))
             snapshots = snapshot_files(repo_dir, target_paths)
@@ -715,7 +786,7 @@ class WorkspaceService:
         meta = self._assert_workspace(owner, repo, workspace_id)
         repo_dir = self.manager.repo_dir(workspace_id)
         max_bytes = min(request.max_bytes or self.settings.workspace_max_write_bytes, self.settings.workspace_max_write_bytes)
-        with self.manager.lock(workspace_id):
+        with self.manager.workspace_scope(workspace_id):
             path, resolved = validate_write_target(self.policy, repo_dir, request.path, operation="modified", error_code=ErrorCode.WORKSPACE_WRITE_INVALID_PATH)
             previous_bytes: bytes | None = None
             if resolved.exists():
@@ -814,7 +885,7 @@ class WorkspaceService:
                 return WorkspaceCommitAndPushResponse(**cached)
 
         repo_dir = self.manager.repo_dir(workspace_id)
-        with self.manager.lock(workspace_id):
+        with self.manager.workspace_scope(workspace_id):
             await self.manager.fetch_branch(repo_dir, request.branch)
             remote_head = await self.manager.remote_head_sha(repo_dir, request.branch)
             if remote_head != request.expected_head_sha:
@@ -974,11 +1045,12 @@ class WorkspaceService:
         manifest_path_rel = _relative_repo_path(repo_dir, manifest_path)
         gitignore_path_rel = ".git/info/exclude"
 
-        with self.manager.lock(workspace_id):
+        with self.manager.workspace_scope(workspace_id):
             gitignore_updated = _ensure_gpt_artifacts_local_exclude(repo_dir)
             existing_manifest = _read_artifact_manifest(manifest_path)
             skipped = _manifest_is_current(repo_dir, existing_manifest, remote_fingerprint)
             if skipped:
+                assert existing_manifest is not None
                 artifacts = [SyncedRunArtifact(**item) for item in existing_manifest.get("artifacts", [])]
             else:
                 _remove_existing_artifact_target(target_dir)
@@ -1080,10 +1152,6 @@ class WorkspaceService:
     @staticmethod
     def _diagnostics_model(result) -> WorkspacePrepareDiagnostics:
         return WorkspacePrepareDiagnostics(
-            mirror_stage=result.mirror.stage,
-            mirror_duration_ms=result.mirror.duration_ms,
-            mirror_pack_bytes=result.mirror.pack_bytes,
-            mirror_pack_files=result.mirror.pack_files,
             workspace_stage=result.workspace_stage,
             workspace_duration_ms=result.workspace_duration_ms,
             total_duration_ms=result.total_duration_ms,
@@ -1099,7 +1167,6 @@ class WorkspaceService:
             head_sha=result.meta.head_sha,
             default_branch=result.meta.default_branch,
             created=result.created,
-            refreshed=result.refreshed,
             diagnostics=self._diagnostics_model(result),
         )
 
@@ -1107,8 +1174,6 @@ class WorkspaceService:
     def _prepare_metadata(result) -> dict:
         return {
             "created": result.created,
-            "refreshed": result.refreshed,
-            "mirror": asdict(result.mirror),
             "workspace_stage": result.workspace_stage,
             "workspace_duration_ms": result.workspace_duration_ms,
             "total_duration_ms": result.total_duration_ms,
