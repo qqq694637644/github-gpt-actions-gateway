@@ -33,6 +33,7 @@ from app.services.workspaces import WorkspaceService
 from app.storage.audit import AuditStore
 from app.workspace.manager import WorkspaceManager, split_command
 from app.workspace.models import CommandResult
+from app.workspace.text_ops import PreparedFileChange, commit_prepared_changes
 
 _prepare_counter = itertools.count()
 
@@ -1131,4 +1132,159 @@ def test_workspace_write_file_rejects_sensitive_path(tmp_path: Path):
     with pytest.raises(ApiError) as exc:
         run(service.write_file("acme", "demo", prepared.workspace_id, WorkspaceWriteFileRequest(path=".env", content="SECRET=x\n")))
     assert exc.value.error_code == ErrorCode.WORKSPACE_POLICY_VIOLATION
+
+
+def test_workspace_write_and_patch_dry_runs_never_touch_disk(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    existing_empty = repo_dir / "existing-empty"
+    existing_empty.mkdir()
+    readme = repo_dir / "README.md"
+    before = readme.stat()
+
+    write = run(
+        service.write_file(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceWriteFileRequest(
+                path="existing-empty/write.txt",
+                content="content\n",
+                dry_run=True,
+            ),
+        )
+    )
+    assert write.written is False
+    assert write.changed_files[0].operation == "added"
+    assert existing_empty.is_dir()
+    assert not (existing_empty / "write.txt").exists()
+
+    patch_text = (
+        "*** Begin Patch\n"
+        "*** Update File: README.md\n"
+        "@@\n"
+        "-before\n"
+        "+after\n"
+        "*** Add File: existing-empty/patch.txt\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+    patch_result = run(
+        service.apply_patch(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceApplyPatchRequest(patch=patch_text, dry_run=True),
+        )
+    )
+    assert patch_result.applied is False
+    assert {item.path for item in patch_result.changed_files} == {"README.md", "existing-empty/patch.txt"}
+    assert readme.read_text(encoding="utf-8") == "before\n"
+    assert existing_empty.is_dir()
+    assert not (existing_empty / "patch.txt").exists()
+    after = readme.stat()
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert after.st_ino == before.st_ino
+
+
+def test_workspace_patch_context_failure_is_precomputed_before_writes(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    readme = repo_dir / "README.md"
+    before = readme.stat()
+    patch_text = (
+        "*** Begin Patch\n"
+        "*** Update File: README.md\n"
+        "@@\n"
+        "-before\n"
+        "+first-change\n"
+        "*** Update File: README.md\n"
+        "@@\n"
+        "-missing\n"
+        "+second-change\n"
+        "*** End Patch\n"
+    )
+
+    with pytest.raises(ApiError) as exc:
+        run(
+            service.apply_patch(
+                "acme",
+                "demo",
+                prepared.workspace_id,
+                WorkspaceApplyPatchRequest(patch=patch_text),
+            )
+        )
+
+    assert exc.value.error_code == ErrorCode.WORKSPACE_PATCH_CONTEXT_MISMATCH
+    assert readme.read_text(encoding="utf-8") == "before\n"
+    after = readme.stat()
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert after.st_ino == before.st_ino
+
+
+def test_commit_prepared_changes_rolls_back_all_files_on_commit_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    first = repo_dir / "first.txt"
+    second = repo_dir / "second.txt"
+    first.write_bytes(b"first-before\n")
+    second.write_bytes(b"second-before\n")
+    changes = [
+        PreparedFileChange(path="first.txt", resolved_path=first, before=b"first-before\n", after=b"first-after\n"),
+        PreparedFileChange(path="second.txt", resolved_path=second, before=b"second-before\n", after=b"second-after\n"),
+    ]
+    real_replace = os.replace
+    stage_replaces = 0
+
+    def fail_second_stage_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        nonlocal stage_replaces
+        if str(source).endswith(".stage"):
+            stage_replaces += 1
+            if stage_replaces == 2:
+                raise OSError("injected stage replace failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr("app.workspace.text_ops.os.replace", fail_second_stage_replace)
+    with pytest.raises(OSError, match="injected stage replace failure"):
+        commit_prepared_changes(repo_dir, changes)
+
+    assert first.read_bytes() == b"first-before\n"
+    assert second.read_bytes() == b"second-before\n"
+    assert not list(repo_dir.glob(".*.stage"))
+    assert not list(repo_dir.glob(".*.backup"))
+
+
+def test_workspace_read_files_returns_next_start_line(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
+
+    response = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=["README.md"], start_line=1, max_lines=1),
+        )
+    )
+
+    assert response.files[0].truncated is False
+    assert response.files[0].next_start_line is None
+
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    (repo_dir / "README.md").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    truncated = run(
+        service.read_files(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceReadFilesRequest(paths=["README.md"], start_line=1, max_lines=2),
+        )
+    )
+    assert truncated.files[0].truncated is True
+    assert truncated.files[0].next_start_line == 3
 

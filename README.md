@@ -79,6 +79,10 @@ Use:
 - `workspaceDiff` before publishing;
 - `workspaceCommitAndPush` with the current `expected_head_sha`.
 
+Truncated `workspaceReadFiles` and inspect file results include `next_start_line` so callers can continue without guessing the next line number.
+
+`workspaceWriteFile` and `workspaceApplyPatch` calculate dry-run results entirely in memory and do not create, replace, delete, or restore files. Patch requests fully calculate and validate every target first. Real writes stage all replacement content before committing it, with per-file backups used to roll back a commit error.
+
 Workspace IDs cannot be supplied to `prepareWorkspace` and cannot be selected by the client.
 
 ## Asynchronous commands

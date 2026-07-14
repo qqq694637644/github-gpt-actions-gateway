@@ -16,6 +16,7 @@ from app.errors import ApiError, ErrorCode
 from app.github.client import GitHubClient
 from app.models.branches import CreateWorkBranchRequest, CreateWorkBranchResponse
 from app.models.ci import SyncedRunArtifact, SyncRunArtifactsToWorkspaceRequest, SyncRunArtifactsToWorkspaceResponse
+from app.models.common import ChangedFile
 from app.models.workspaces import (
     PrepareWorkspaceRequest,
     PrepareWorkspaceResponse,
@@ -56,12 +57,15 @@ from app.storage.audit import AuditStore, canonical_hash
 from app.workspace.manager import WorkspaceManager, command_hash
 from app.workspace.operations import WorkspaceOperationManager
 from app.workspace.text_ops import (
-    apply_text_patch,
+    PreparedFileChange,
     assert_payload_size,
     assert_text_bytes,
+    commit_prepared_changes,
+    describe_prepared_changes,
     normalize_line_endings,
     parse_codex_patch,
-    restore_files,
+    prepare_text_patch,
+    prepare_write_change,
     sha256_hex,
     snapshot_files,
     validate_write_target,
@@ -559,6 +563,7 @@ class WorkspaceService:
             end_line = start_line + len(output_lines) - 1 if output_lines else None
             content = "\n".join(output_lines)
             content, content_truncated = _clip_text_to_bytes(content, max_bytes)
+            was_truncated = truncated or content_truncated
             return WorkspaceFileContent(
                 path=normalized,
                 start_line=start_line,
@@ -567,7 +572,8 @@ class WorkspaceService:
                 bytes=len(data),
                 sha256=hashlib.sha256(data).hexdigest(),
                 content=content,
-                truncated=truncated or content_truncated,
+                truncated=was_truncated,
+                next_start_line=(end_line + 1 if end_line is not None else start_line) if was_truncated else None,
             )
         except Exception as exc:
             if isinstance(exc, ApiError):
@@ -613,12 +619,34 @@ class WorkspaceService:
             )
         return max_bytes
 
+    def _validate_prepared_changes(self, changes: list[PreparedFileChange], changed_files: list[ChangedFile]) -> None:
+        changed_by_path = {item.path: item for item in changed_files}
+        for change in changes:
+            changed = changed_by_path[change.path]
+            self.policy.assert_write_path_allowed(change.path, operation=changed.operation)
+            if change.after is None:
+                continue
+            self.policy.assert_file_size(len(change.after), max_size=self.settings.max_blob_read_bytes)
+            if self.policy.looks_binary(change.after):
+                raise ApiError(
+                    ErrorCode.BINARY_FILE_NOT_ALLOWED,
+                    "Non-text changes are not allowed in workspace text operations.",
+                    status_code=403,
+                    details={"path": change.path},
+                )
+
     def _fit_read_files_response(self, response: WorkspaceReadFilesResponse, max_bytes: int) -> WorkspaceReadFilesResponse:
         while _model_json_bytes(response) > max_bytes and response.files:
             files = list(response.files)
             last_file = files[-1]
             if last_file.content:
-                files[-1] = last_file.model_copy(update={"content": "", "truncated": True})
+                files[-1] = last_file.model_copy(
+                    update={
+                        "content": "",
+                        "truncated": True,
+                        "next_start_line": last_file.start_line,
+                    }
+                )
             else:
                 files.pop()
             response = response.model_copy(update={"files": files, "truncated": True})
@@ -657,7 +685,13 @@ class WorkspaceService:
                 files = list(response.files)
                 last_file = files[-1]
                 if last_file.content:
-                    files[-1] = last_file.model_copy(update={"content": "", "truncated": True})
+                    files[-1] = last_file.model_copy(
+                        update={
+                            "content": "",
+                            "truncated": True,
+                            "next_start_line": last_file.start_line,
+                        }
+                    )
                 else:
                     files.pop()
                 response = response.model_copy(update={"files": files, "truncated": True})
@@ -753,27 +787,34 @@ class WorkspaceService:
             operations = parse_codex_patch(request.patch, self.policy, repo_dir, allow_delete=request.allow_delete, max_changed_files=max_changed_files)
             target_paths = list(dict.fromkeys(item.path for item in operations))
             snapshots = snapshot_files(repo_dir, target_paths)
-            should_restore = True
-            try:
-                apply_text_patch(repo_dir, operations)
-                changed = await self.manager.changed_files_for_paths(repo_dir, target_paths)
-                if len(changed) > max_changed_files:
-                    raise ApiError(ErrorCode.WORKSPACE_TOO_MANY_CHANGED_FILES, "Patch changes too many files.", status_code=413, details={"count": len(changed), "max": max_changed_files})
-                await self.manager.validate_changed_paths(repo_dir, changed)
-                diff_stat = await self.manager.diff_stat_for_paths(repo_dir, target_paths)
-                response = WorkspaceApplyPatchResponse(
-                    applied=not request.dry_run,
-                    dry_run=request.dry_run,
-                    changed_files=changed,
-                    diff_stat=diff_stat,
+            prepared = prepare_text_patch(repo_dir, operations, snapshots)
+            changed, diff_stat = describe_prepared_changes(prepared)
+            if len(changed) > max_changed_files:
+                raise ApiError(
+                    ErrorCode.WORKSPACE_TOO_MANY_CHANGED_FILES,
+                    "Patch changes too many files.",
+                    status_code=413,
+                    details={"count": len(changed), "max": max_changed_files},
                 )
-                should_restore = request.dry_run
-            except Exception:
-                restore_files(repo_dir, snapshots)
-                raise
-            finally:
-                if should_restore:
-                    restore_files(repo_dir, snapshots)
+            self._validate_prepared_changes(prepared, changed)
+            if not request.dry_run:
+                try:
+                    commit_prepared_changes(repo_dir, prepared)
+                except Exception as exc:
+                    if isinstance(exc, ApiError):
+                        raise
+                    raise ApiError(
+                        ErrorCode.WORKSPACE_WRITE_FAILED,
+                        "Failed to commit the prepared workspace patch.",
+                        status_code=500,
+                        details={"paths": target_paths, "error": str(exc)},
+                    ) from exc
+            response = WorkspaceApplyPatchResponse(
+                applied=not request.dry_run,
+                dry_run=request.dry_run,
+                changed_files=changed,
+                diff_stat=diff_stat,
+            )
         self._audit(
             operation_id="workspaceApplyPatch",
             owner=owner,
@@ -824,28 +865,24 @@ class WorkspaceService:
             else:
                 operation = "modified"
 
-            changed = []
+            changed: list[ChangedFile] = []
             diff_stat = ""
             if operation != "unchanged":
-                snapshots = snapshot_files(repo_dir, [path])
-                should_restore = True
-                try:
-                    resolved.parent.mkdir(parents=True, exist_ok=True)
-                    resolved.write_bytes(data)
-                    changed = await self.manager.changed_files_for_paths(repo_dir, [path])
-                    if len(changed) > 1:
-                        raise ApiError(ErrorCode.WORKSPACE_TOO_MANY_CHANGED_FILES, "write-file unexpectedly changed more than one file.", status_code=409, details={"count": len(changed)})
-                    await self.manager.validate_changed_paths(repo_dir, changed)
-                    diff_stat = await self.manager.diff_stat_for_paths(repo_dir, [path])
-                    should_restore = request.dry_run
-                except Exception as exc:
-                    restore_files(repo_dir, snapshots)
-                    if isinstance(exc, ApiError):
-                        raise
-                    raise ApiError(ErrorCode.WORKSPACE_WRITE_FAILED, "Failed to write workspace file.", status_code=500, details={"path": path, "error": str(exc)}) from exc
-                finally:
-                    if should_restore:
-                        restore_files(repo_dir, snapshots)
+                prepared = prepare_write_change(path=path, resolved_path=resolved, before=previous_bytes, after=data)
+                changed, diff_stat = describe_prepared_changes(prepared)
+                self._validate_prepared_changes(prepared, changed)
+                if not request.dry_run:
+                    try:
+                        commit_prepared_changes(repo_dir, prepared)
+                    except Exception as exc:
+                        if isinstance(exc, ApiError):
+                            raise
+                        raise ApiError(
+                            ErrorCode.WORKSPACE_WRITE_FAILED,
+                            "Failed to write workspace file.",
+                            status_code=500,
+                            details={"path": path, "error": str(exc)},
+                        ) from exc
             response = WorkspaceWriteFileResponse(
                 written=bool(operation != "unchanged" and not request.dry_run),
                 dry_run=request.dry_run,

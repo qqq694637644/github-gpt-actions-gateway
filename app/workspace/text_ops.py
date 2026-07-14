@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
+import os
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 from app.errors import ApiError, ErrorCode
+from app.models.common import ChangedFile
 from app.policy.rules import Policy
 
 PatchKind = Literal["update", "add", "delete"]
@@ -37,6 +41,14 @@ class FileSnapshot:
     resolved_path: Path
     existed: bool
     data: bytes | None
+
+
+@dataclass(frozen=True)
+class PreparedFileChange:
+    path: str
+    resolved_path: Path
+    before: bytes | None
+    after: bytes | None
 
 
 def sha256_hex(data: bytes) -> str:
@@ -109,30 +121,6 @@ def snapshot_files(repo_dir: Path, paths: list[str]) -> list[FileSnapshot]:
     return snapshots
 
 
-def restore_files(repo_dir: Path, snapshots: list[FileSnapshot]) -> None:
-    repo_root = repo_dir.resolve()
-    for snapshot in snapshots:
-        if snapshot.existed:
-            snapshot.resolved_path.parent.mkdir(parents=True, exist_ok=True)
-            snapshot.resolved_path.write_bytes(snapshot.data or b"")
-        else:
-            try:
-                if snapshot.resolved_path.exists() and snapshot.resolved_path.is_file():
-                    snapshot.resolved_path.unlink()
-            finally:
-                _remove_empty_parents(snapshot.resolved_path.parent, repo_root)
-
-
-def _remove_empty_parents(path: Path, stop_at: Path) -> None:
-    current = path.resolve(strict=False)
-    while current != stop_at:
-        try:
-            current.rmdir()
-        except OSError:
-            return
-        current = current.parent
-
-
 def parse_codex_patch(patch: str, policy: Policy, repo_dir: Path, *, allow_delete: bool, max_changed_files: int) -> list[TextPatchOperation]:
     payload = patch.encode("utf-8")
     assert_text_bytes(payload, error_code=ErrorCode.WORKSPACE_BINARY_NOT_ALLOWED)
@@ -187,24 +175,182 @@ def parse_codex_patch(patch: str, policy: Policy, repo_dir: Path, *, allow_delet
     return operations
 
 
-def apply_text_patch(repo_dir: Path, operations: list[TextPatchOperation]) -> list[str]:
-    changed_paths: list[str] = []
+def prepare_text_patch(
+    repo_dir: Path,
+    operations: list[TextPatchOperation],
+    snapshots: list[FileSnapshot],
+) -> list[PreparedFileChange]:
+    current = {snapshot.path: snapshot.data for snapshot in snapshots}
     for operation in operations:
-        file_path = resolve_workspace_file(repo_dir, operation.path, error_code=ErrorCode.WORKSPACE_POLICY_VIOLATION)
         if operation.kind == "add":
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(_join_lines(operation.add_lines, trailing_newline=bool(operation.add_lines)), encoding="utf-8", newline="")
+            current[operation.path] = _join_lines(
+                operation.add_lines,
+                trailing_newline=bool(operation.add_lines),
+            ).encode("utf-8")
         elif operation.kind == "delete":
-            file_path.unlink()
+            current[operation.path] = None
         else:
-            original = file_path.read_bytes()
+            original = current[operation.path]
+            if original is None:
+                raise ApiError(
+                    ErrorCode.WORKSPACE_PATCH_CONTEXT_MISMATCH,
+                    "Patch update target no longer exists.",
+                    status_code=409,
+                    details={"path": operation.path},
+                )
             assert_text_bytes(original, path=operation.path)
             original_text = original.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
             lines, trailing = _split_text_lines(original_text)
             new_lines = _apply_hunks(lines, operation.hunks, operation.path)
-            file_path.write_text(_join_lines(new_lines, trailing_newline=trailing), encoding="utf-8", newline="")
-        changed_paths.append(operation.path)
-    return changed_paths
+            current[operation.path] = _join_lines(new_lines, trailing_newline=trailing).encode("utf-8")
+    return [
+        PreparedFileChange(
+            path=snapshot.path,
+            resolved_path=snapshot.resolved_path,
+            before=snapshot.data,
+            after=current[snapshot.path],
+        )
+        for snapshot in snapshots
+        if snapshot.data != current[snapshot.path]
+    ]
+
+
+def prepare_write_change(
+    *,
+    path: str,
+    resolved_path: Path,
+    before: bytes | None,
+    after: bytes,
+) -> list[PreparedFileChange]:
+    if before == after:
+        return []
+    return [
+        PreparedFileChange(
+            path=path,
+            resolved_path=resolved_path,
+            before=before,
+            after=after,
+        )
+    ]
+
+
+def describe_prepared_changes(changes: list[PreparedFileChange]) -> tuple[list[ChangedFile], str]:
+    changed_files: list[ChangedFile] = []
+    for change in changes:
+        if change.before is None:
+            operation = "added"
+        elif change.after is None:
+            operation = "deleted"
+        else:
+            operation = "modified"
+        additions, deletions = _line_change_counts(change.before, change.after)
+        changed_files.append(
+            ChangedFile(
+                path=change.path,
+                operation=operation,
+                additions=additions,
+                deletions=deletions,
+            )
+        )
+
+    stat_lines = [
+        f" {item.path} | {item.additions + item.deletions} "
+        f"{'+' * min(item.additions, 40)}{'-' * min(item.deletions, 40)}"
+        for item in changed_files
+    ]
+    if changed_files:
+        total_additions = sum(item.additions for item in changed_files)
+        total_deletions = sum(item.deletions for item in changed_files)
+        stat_lines.append(
+            f" {len(changed_files)} file(s) changed, "
+            f"{total_additions} insertion(s)(+), {total_deletions} deletion(s)(-)"
+        )
+    return changed_files, "\n".join(stat_lines)
+
+
+def commit_prepared_changes(repo_dir: Path, changes: list[PreparedFileChange]) -> None:
+    repo_root = repo_dir.resolve()
+    staged: dict[str, Path] = {}
+    backups: dict[str, Path] = {}
+    committed: list[PreparedFileChange] = []
+    created_dirs: set[Path] = set()
+    succeeded = False
+    try:
+        for change in changes:
+            created_dirs.update(_missing_parent_dirs(change.resolved_path.parent, repo_root))
+            change.resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            if change.after is not None:
+                temporary = change.resolved_path.with_name(
+                    f".{change.resolved_path.name}.{secrets.token_hex(8)}.stage"
+                )
+                temporary.write_bytes(change.after)
+                staged[change.path] = temporary
+
+        for change in changes:
+            target = change.resolved_path
+            if change.before is not None:
+                backup_path = target.with_name(f".{target.name}.{secrets.token_hex(8)}.backup")
+                os.replace(target, backup_path)
+                backups[change.path] = backup_path
+            committed.append(change)
+            if change.after is not None:
+                temporary = staged[change.path]
+                os.replace(temporary, target)
+                staged.pop(change.path)
+
+        succeeded = True
+    except Exception:
+        for change in reversed(committed):
+            target = change.resolved_path
+            try:
+                if target.exists() and target.is_file():
+                    target.unlink()
+                existing_backup = backups.get(change.path)
+                if existing_backup is not None and existing_backup.exists():
+                    os.replace(existing_backup, target)
+            except OSError:
+                pass
+        raise
+    finally:
+        for temporary in staged.values():
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        if succeeded:
+            for backup_path in backups.values():
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
+        else:
+            for directory in sorted(created_dirs, key=lambda item: len(item.parts), reverse=True):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+
+
+def _missing_parent_dirs(path: Path, repo_root: Path) -> set[Path]:
+    missing: set[Path] = set()
+    current = path
+    while current != repo_root and repo_root in current.parents and not current.exists():
+        missing.add(current)
+        current = current.parent
+    return missing
+
+
+def _line_change_counts(before: bytes | None, after: bytes | None) -> tuple[int, int]:
+    old_lines = [] if before is None else before.decode("utf-8", errors="replace").splitlines()
+    new_lines = [] if after is None else after.decode("utf-8", errors="replace").splitlines()
+    additions = 0
+    deletions = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=old_lines, b=new_lines).get_opcodes():
+        if tag in {"insert", "replace"}:
+            additions += j2 - j1
+        if tag in {"delete", "replace"}:
+            deletions += i2 - i1
+    return additions, deletions
 
 
 def _collect_operation_body(lines: list[str], start: int) -> tuple[list[str], int]:
