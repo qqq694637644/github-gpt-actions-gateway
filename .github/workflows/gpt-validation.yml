@@ -25,3 +25,5 @@ jobs:
         run: pytest -q
       - name: Validate public OpenAPI surface
         run: python scripts/export_openapi.py
+        env:
+          PUBLIC_BASE_URL: https://gateway.example.com

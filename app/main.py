@@ -19,7 +19,7 @@ from app.workspace.manager import WorkspaceManager
 from app.workspace.operations import WorkspaceOperationManager
 
 SCHEMA_VERSION = "3"
-MINIMUM_PROMPT_VERSION = "3.1"
+MINIMUM_PROMPT_VERSION = "3.2"
 
 
 def create_app() -> FastAPI:

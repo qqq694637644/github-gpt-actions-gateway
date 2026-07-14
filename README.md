@@ -308,9 +308,10 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m ruff check .
 .\.venv\Scripts\python.exe -m mypy app
+$env:PUBLIC_BASE_URL='https://gateway.example.com'
 .\.venv\Scripts\python.exe scripts\export_openapi.py
 ```
 
-The export script validates the public operation ID set and marks every exported Action with `x-openai-isConsequential=false`.
+The export script requires the OpenAPI server URL to be explicitly configured through `PUBLIC_BASE_URL` (environment or `.env`), validates that it is an absolute HTTP(S) URL, validates the public operation ID set, and marks every exported Action with `x-openai-isConsequential=false`. It does not silently export the development default `http://localhost:8000`.
 
-Every HTTP response includes `X-Gateway-Schema-Version`. The OpenAPI information block publishes Gateway schema version 3 and minimum prompt version 3.1.
+Every HTTP response includes `X-Gateway-Schema-Version`. The OpenAPI information block publishes Gateway schema version 3 and minimum prompt version 3.2.

@@ -1,8 +1,14 @@
+from pathlib import Path
+
+import pytest
+
 from app.main import app
 from scripts.export_openapi import (
     PUBLIC_OPERATION_IDS,
     collect_operation_ids,
+    configured_openapi_server_url,
     filter_public_operations,
+    normalize_openapi_server_url,
     validate_request_body_object_schemas,
 )
 
@@ -18,7 +24,41 @@ def test_openapi_contains_only_public_v3_operation_ids():
     assert "workspaceReset" not in PUBLIC_OPERATION_IDS
     assert "createWorkBranch" not in PUBLIC_OPERATION_IDS
     assert schema["info"]["x-gateway-schema-version"] == "3"
-    assert schema["info"]["x-minimum-prompt-version"] == "3.1"
+    assert schema["info"]["x-minimum-prompt-version"] == "3.2"
+
+
+def test_export_server_url_comes_from_public_base_url(monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://gateway.example.com/github/")
+
+    assert configured_openapi_server_url() == "https://gateway.example.com/github"
+
+
+def test_export_requires_explicit_public_base_url(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+    with pytest.raises(SystemExit, match="must be set"):
+        configured_openapi_server_url()
+
+
+def test_export_server_url_rejects_invalid_values():
+    with pytest.raises(SystemExit, match="absolute http"):
+        normalize_openapi_server_url("localhost:8000")
+    with pytest.raises(SystemExit, match="query string or fragment"):
+        normalize_openapi_server_url("https://gateway.example.com?token=secret")
+
+
+def test_prompt_version_matches_openapi_minimum():
+    prompt = (Path(__file__).parents[1] / "PROMPT.md").read_text(encoding="utf-8")
+
+    assert "Prompt version: 3.2" in prompt
+    assert app.openapi()["info"]["x-minimum-prompt-version"] == "3.2"
+
+
+def test_workspace_file_content_exposes_continuation_line():
+    properties = app.openapi()["components"]["schemas"]["WorkspaceFileContent"]["properties"]
+
+    assert "next_start_line" in properties
 
 
 def test_export_marks_all_public_operations_low_risk_nonconsequential():
