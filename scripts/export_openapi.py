@@ -3,13 +3,35 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.api.public_operations import PUBLIC_OPERATION_IDS, filter_and_mark_public_operations  # noqa: E402
 
-OPENAPI_SERVER_URL = "https://estranged-evergreen-hatchet.ngrok-free.dev/github"
+
+def normalize_openapi_server_url(value: str) -> str:
+    server_url = value.strip().rstrip("/")
+    parsed = urlsplit(server_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise SystemExit(
+            "PUBLIC_BASE_URL must be an absolute http(s) URL before exporting OpenAPI."
+        )
+    if parsed.query or parsed.fragment:
+        raise SystemExit("PUBLIC_BASE_URL must not contain a query string or fragment.")
+    return server_url
+
+
+def configured_openapi_server_url() -> str:
+    from app.config.settings import Settings
+
+    settings = Settings()
+    if "public_base_url" not in settings.model_fields_set:
+        raise SystemExit(
+            "PUBLIC_BASE_URL must be set in the environment or .env before exporting OpenAPI."
+        )
+    return normalize_openapi_server_url(settings.public_base_url)
 
 def collect_operation_ids(schema: dict) -> set[str]:
     operation_ids: set[str] = set()
@@ -80,7 +102,7 @@ def main() -> None:
 
     schema = app.openapi()
     filter_public_operations(schema)
-    schema["servers"] = [{"url": OPENAPI_SERVER_URL}]
+    schema["servers"] = [{"url": configured_openapi_server_url()}]
     validate_public_operations(schema)
     mark_all_operations_nonconsequential(schema)
     out = ROOT / "openapi.json"
