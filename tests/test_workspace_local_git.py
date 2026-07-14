@@ -6,6 +6,7 @@ import io
 import itertools
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -1229,6 +1230,7 @@ def test_workspace_patch_context_failure_is_precomputed_before_writes(tmp_path: 
 def test_commit_prepared_changes_rolls_back_all_files_on_commit_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
     first = repo_dir / "first.txt"
     second = repo_dir / "second.txt"
     first.write_bytes(b"first-before\n")
@@ -1287,4 +1289,153 @@ def test_workspace_read_files_returns_next_start_line(tmp_path: Path):
     )
     assert truncated.files[0].truncated is True
     assert truncated.files[0].next_start_line == 3
+
+
+def test_partial_stage_write_is_cleaned_from_git_transaction_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _, repo_dir = make_local_repo(tmp_path)
+    target = repo_dir / "first.txt"
+    target.write_bytes(b"before\n")
+    change = PreparedFileChange(
+        path="first.txt",
+        resolved_path=target,
+        before=b"before\n",
+        after=b"after\n",
+    )
+    transaction_parent = repo_dir / ".git" / "gpt-workspace-transactions"
+    real_write_bytes = Path.write_bytes
+
+    def partial_then_fail(path: Path, data: bytes) -> int:
+        if path.suffix == ".stage":
+            with path.open("wb") as handle:
+                handle.write(data[:2])
+            raise OSError("injected stage write failure")
+        return real_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", partial_then_fail)
+    with pytest.raises(OSError, match="injected stage write failure"):
+        commit_prepared_changes(repo_dir, [change])
+
+    assert target.read_bytes() == b"before\n"
+    assert not transaction_parent.exists()
+    assert git("status", "--porcelain", cwd=repo_dir) == "?? first.txt"
+
+
+def test_transaction_cleanup_failure_rolls_back_workspace_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _, repo_dir = make_local_repo(tmp_path)
+    target = repo_dir / "README.md"
+    before_bytes = target.read_bytes()
+    change = PreparedFileChange(
+        path="README.md",
+        resolved_path=target,
+        before=before_bytes,
+        after=b"after\n",
+    )
+    transaction_parent = repo_dir / ".git" / "gpt-workspace-transactions"
+    real_rmtree = shutil.rmtree
+    calls = 0
+
+    def fail_once(path: str | os.PathLike[str], *args, **kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError("injected cleanup failure")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr("app.workspace.text_ops.shutil.rmtree", fail_once)
+    with pytest.raises(OSError, match="committed changes were rolled back"):
+        commit_prepared_changes(repo_dir, [change])
+
+    assert target.read_bytes() == before_bytes
+    assert not transaction_parent.exists()
+    assert git("status", "--porcelain", cwd=repo_dir) == ""
+
+
+def test_write_response_matches_final_git_state_relative_to_head(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    readme = repo_dir / "README.md"
+    readme.write_text("dirty\n", encoding="utf-8")
+
+    response = run(
+        service.write_file(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceWriteFileRequest(
+                path="README.md",
+                content="before\n",
+                mode="overwrite",
+            ),
+        )
+    )
+
+    assert response.changed_files == []
+    assert response.diff_stat == ""
+    assert git("status", "--porcelain", cwd=repo_dir) == ""
+
+    scratch = repo_dir / "scratch.txt"
+    scratch.write_text("existing untracked\n", encoding="utf-8")
+    untracked = run(
+        service.write_file(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceWriteFileRequest(
+                path="scratch.txt",
+                content="updated untracked\n",
+                mode="overwrite",
+                dry_run=True,
+            ),
+        )
+    )
+    assert len(untracked.changed_files) == 1
+    assert untracked.changed_files[0].operation == "added"
+    assert scratch.read_text(encoding="utf-8") == "existing untracked\n"
+
+
+def test_long_single_line_continuation_retries_current_line(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, manager = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    (repo_dir / "README.md").write_text("abcdefghij\nsecond\n", encoding="utf-8")
+
+    result = service._read_file_content(
+        repo_dir,
+        "README.md",
+        start_line=1,
+        max_lines=2,
+        max_bytes=6,
+    )
+
+    assert result.content == ""
+    assert result.end_line is None
+    assert result.truncated is True
+    assert result.next_start_line == 1
+
+
+def test_newline_only_change_has_nonzero_git_relative_counts(tmp_path: Path):
+    remote, _ = make_local_repo(tmp_path)
+    service, _ = make_service(tmp_path, remote)
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
+
+    response = run(
+        service.write_file(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceWriteFileRequest(
+                path="README.md",
+                content="before",
+                mode="overwrite",
+                dry_run=True,
+            ),
+        )
+    )
+
+    assert len(response.changed_files) == 1
+    assert response.changed_files[0].additions == 1
+    assert response.changed_files[0].deletions == 1
 

@@ -79,9 +79,11 @@ Use:
 - `workspaceDiff` before publishing;
 - `workspaceCommitAndPush` with the current `expected_head_sha`.
 
-Truncated `workspaceReadFiles` and inspect file results include `next_start_line` so callers can continue without guessing the next line number.
+Truncated `workspaceReadFiles` and inspect file results include `next_start_line` so callers can continue without guessing the next line number. A line that cannot fit in the per-file byte budget is not returned partially; `next_start_line` remains on that line so the caller can retry with a larger budget.
 
-`workspaceWriteFile` and `workspaceApplyPatch` calculate dry-run results entirely in memory and do not create, replace, delete, or restore files. Patch requests fully calculate and validate every target first. Real writes stage all replacement content before committing it, with per-file backups used to roll back a commit error.
+`workspaceWriteFile` and `workspaceApplyPatch` calculate dry-run results entirely in memory and do not create, replace, delete, or restore files. Patch requests fully calculate and validate every target first. Real writes stage all replacement content under `.git/gpt-workspace-transactions` before committing it, with per-file backups used to roll back commit or cleanup errors. Transaction files never appear as untracked worktree files.
+
+For these Git-backed tools, `changed_files` and `diff_stat` describe the expected final worktree relative to `HEAD`, including Git working-tree filters such as CRLF conversion. Restoring a dirty tracked file to its `HEAD` content therefore returns no final change, while updating an existing untracked file is still reported as `added`.
 
 Workspace IDs cannot be supplied to `prepareWorkspace` and cannot be selected by the client.
 

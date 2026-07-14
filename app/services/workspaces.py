@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -545,18 +548,17 @@ class WorkspaceService:
             output_lines: list[str] = []
             output_bytes = 0
             truncated = start_idx + len(selected) < len(lines)
+            next_start_line: int | None = start_line + len(selected) if truncated else None
             for offset, line in enumerate(selected, start=start_line):
                 rendered = f"{offset}: {line}"
                 rendered_bytes = len((rendered + "\n").encode("utf-8"))
                 if rendered_bytes > max_bytes:
-                    clipped, _ = _clip_text_to_bytes(rendered, max_bytes)
-                    if clipped:
-                        output_lines.append(clipped)
-                        output_bytes += len(clipped.encode("utf-8"))
                     truncated = True
+                    next_start_line = offset
                     break
                 if output_bytes + rendered_bytes > max_bytes:
                     truncated = True
+                    next_start_line = offset
                     break
                 output_lines.append(rendered)
                 output_bytes += rendered_bytes
@@ -573,7 +575,7 @@ class WorkspaceService:
                 sha256=hashlib.sha256(data).hexdigest(),
                 content=content,
                 truncated=was_truncated,
-                next_start_line=(end_line + 1 if end_line is not None else start_line) if was_truncated else None,
+                next_start_line=next_start_line if was_truncated else None,
             )
         except Exception as exc:
             if isinstance(exc, ApiError):
@@ -622,8 +624,9 @@ class WorkspaceService:
     def _validate_prepared_changes(self, changes: list[PreparedFileChange], changed_files: list[ChangedFile]) -> None:
         changed_by_path = {item.path: item for item in changed_files}
         for change in changes:
-            changed = changed_by_path[change.path]
-            self.policy.assert_write_path_allowed(change.path, operation=changed.operation)
+            changed = changed_by_path.get(change.path)
+            operation = changed.operation if changed is not None else ("deleted" if change.after is None else "modified")
+            self.policy.assert_write_path_allowed(change.path, operation=operation)
             if change.after is None:
                 continue
             self.policy.assert_file_size(len(change.after), max_size=self.settings.max_blob_read_bytes)
@@ -634,6 +637,70 @@ class WorkspaceService:
                     status_code=403,
                     details={"path": change.path},
                 )
+
+    async def _describe_prepared_git_changes(
+        self,
+        repo_dir: Path,
+        changes: list[PreparedFileChange],
+    ) -> tuple[list[ChangedFile], str]:
+        final_changes: list[PreparedFileChange] = []
+        for change in changes:
+            head_bytes = await self._read_head_blob(repo_dir, change.path)
+            if head_bytes == change.after:
+                continue
+            final_changes.append(
+                PreparedFileChange(
+                    path=change.path,
+                    resolved_path=change.resolved_path,
+                    before=head_bytes,
+                    after=change.after,
+                )
+            )
+        return describe_prepared_changes(final_changes)
+
+    async def _read_head_blob(self, repo_dir: Path, path: str) -> bytes | None:
+        max_bytes = self.settings.max_blob_read_bytes
+
+        def read_blob() -> bytes | None:
+            with tempfile.SpooledTemporaryFile(max_size=max_bytes + 1) as output:
+                result = subprocess.run(
+                    [
+                        "git",
+                        "cat-file",
+                        "--filters",
+                        f"--path={path}",
+                        f"HEAD:{path}",
+                    ],
+                    cwd=repo_dir,
+                    stdout=output,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if result.returncode == 128:
+                    return None
+                if result.returncode != 0:
+                    raise ApiError(
+                        ErrorCode.WORKSPACE_EXEC_FAILED,
+                        "Unable to read the HEAD version of a workspace file.",
+                        status_code=500,
+                        details={
+                            "path": path,
+                            "exit_code": result.returncode,
+                            "stderr": result.stderr.decode("utf-8", errors="replace"),
+                        },
+                    )
+                output.seek(0)
+                data = output.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise ApiError(
+                        ErrorCode.WORKSPACE_POLICY_VIOLATION,
+                        "The HEAD version of a workspace file exceeds the configured size limit.",
+                        status_code=413,
+                        details={"path": path, "max_bytes": max_bytes},
+                    )
+                return data
+
+        return await asyncio.to_thread(read_blob)
 
     def _fit_read_files_response(self, response: WorkspaceReadFilesResponse, max_bytes: int) -> WorkspaceReadFilesResponse:
         while _model_json_bytes(response) > max_bytes and response.files:
@@ -788,7 +855,7 @@ class WorkspaceService:
             target_paths = list(dict.fromkeys(item.path for item in operations))
             snapshots = snapshot_files(repo_dir, target_paths)
             prepared = prepare_text_patch(repo_dir, operations, snapshots)
-            changed, diff_stat = describe_prepared_changes(prepared)
+            changed, diff_stat = await self._describe_prepared_git_changes(repo_dir, prepared)
             if len(changed) > max_changed_files:
                 raise ApiError(
                     ErrorCode.WORKSPACE_TOO_MANY_CHANGED_FILES,
@@ -869,7 +936,7 @@ class WorkspaceService:
             diff_stat = ""
             if operation != "unchanged":
                 prepared = prepare_write_change(path=path, resolved_path=resolved, before=previous_bytes, after=data)
-                changed, diff_stat = describe_prepared_changes(prepared)
+                changed, diff_stat = await self._describe_prepared_git_changes(repo_dir, prepared)
                 self._validate_prepared_changes(prepared, changed)
                 if not request.dry_run:
                     try:

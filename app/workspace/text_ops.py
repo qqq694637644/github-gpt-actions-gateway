@@ -4,6 +4,7 @@ import difflib
 import hashlib
 import os
 import secrets
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -270,26 +271,30 @@ def describe_prepared_changes(changes: list[PreparedFileChange]) -> tuple[list[C
 
 def commit_prepared_changes(repo_dir: Path, changes: list[PreparedFileChange]) -> None:
     repo_root = repo_dir.resolve()
+    transaction_parent = _git_dir(repo_root) / "gpt-workspace-transactions"
+    transaction_dir = transaction_parent / ("txn_" + secrets.token_hex(12))
+    staged_dir = transaction_dir / "staged"
+    backup_dir = transaction_dir / "backups"
     staged: dict[str, Path] = {}
     backups: dict[str, Path] = {}
     committed: list[PreparedFileChange] = []
     created_dirs: set[Path] = set()
-    succeeded = False
+    transaction_dir.mkdir(parents=True, exist_ok=False)
     try:
-        for change in changes:
-            created_dirs.update(_missing_parent_dirs(change.resolved_path.parent, repo_root))
-            change.resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        for index, change in enumerate(changes):
             if change.after is not None:
-                temporary = change.resolved_path.with_name(
-                    f".{change.resolved_path.name}.{secrets.token_hex(8)}.stage"
-                )
-                temporary.write_bytes(change.after)
+                staged_dir.mkdir(parents=True, exist_ok=True)
+                temporary = staged_dir / f"{index:04d}.stage"
                 staged[change.path] = temporary
+                temporary.write_bytes(change.after)
 
-        for change in changes:
+        for index, change in enumerate(changes):
             target = change.resolved_path
+            created_dirs.update(_missing_parent_dirs(target.parent, repo_root))
+            target.parent.mkdir(parents=True, exist_ok=True)
             if change.before is not None:
-                backup_path = target.with_name(f".{target.name}.{secrets.token_hex(8)}.backup")
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = backup_dir / f"{index:04d}.backup"
                 os.replace(target, backup_path)
                 backups[change.path] = backup_path
             committed.append(change)
@@ -298,37 +303,86 @@ def commit_prepared_changes(repo_dir: Path, changes: list[PreparedFileChange]) -
                 os.replace(temporary, target)
                 staged.pop(change.path)
 
-        succeeded = True
-    except Exception:
-        for change in reversed(committed):
-            target = change.resolved_path
-            try:
-                if target.exists() and target.is_file():
-                    target.unlink()
-                existing_backup = backups.get(change.path)
-                if existing_backup is not None and existing_backup.exists():
-                    os.replace(existing_backup, target)
-            except OSError:
-                pass
+    except Exception as original:
+        rollback_errors = _rollback_committed_changes(committed, backups)
+        _remove_created_dirs(created_dirs, repo_root)
+        cleanup_error = _cleanup_transaction_dir(transaction_dir, transaction_parent)
+        if rollback_errors or cleanup_error is not None:
+            details = "; ".join([*rollback_errors, *([str(cleanup_error)] if cleanup_error else [])])
+            raise OSError(f"Workspace transaction recovery was incomplete: {details}") from original
         raise
-    finally:
-        for temporary in staged.values():
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-        if succeeded:
-            for backup_path in backups.values():
-                try:
-                    backup_path.unlink()
-                except OSError:
-                    pass
-        else:
-            for directory in sorted(created_dirs, key=lambda item: len(item.parts), reverse=True):
-                try:
-                    directory.rmdir()
-                except OSError:
-                    pass
+    cleanup_error = _cleanup_transaction_dir(transaction_dir, transaction_parent)
+    if cleanup_error is not None:
+        rollback_errors = _rollback_committed_changes(committed, backups)
+        _remove_created_dirs(created_dirs, repo_root)
+        retry_cleanup_error = _cleanup_transaction_dir(transaction_dir, transaction_parent)
+        if rollback_errors or retry_cleanup_error is not None:
+            details = "; ".join(
+                [
+                    *rollback_errors,
+                    *([str(retry_cleanup_error)] if retry_cleanup_error is not None else []),
+                ]
+            )
+            raise OSError(
+                f"Workspace transaction cleanup failed and rollback was incomplete: {details}"
+            ) from cleanup_error
+        raise OSError(
+            f"Workspace transaction cleanup failed; committed changes were rolled back: {cleanup_error}"
+        ) from cleanup_error
+
+
+def _git_dir(repo_root: Path) -> Path:
+    marker = repo_root / ".git"
+    if marker.is_dir():
+        return marker
+    if marker.is_file():
+        text = marker.read_text(encoding="utf-8").strip()
+        if text.lower().startswith("gitdir:"):
+            value = text.split(":", 1)[1].strip()
+            candidate = Path(value)
+            return candidate.resolve() if candidate.is_absolute() else (repo_root / candidate).resolve()
+    raise OSError(f"Git metadata directory was not found for {repo_root}")
+
+
+def _rollback_committed_changes(
+    committed: list[PreparedFileChange],
+    backups: dict[str, Path],
+) -> list[str]:
+    errors: list[str] = []
+    for change in reversed(committed):
+        target = change.resolved_path
+        try:
+            if target.exists() and target.is_file():
+                target.unlink()
+            backup = backups.get(change.path)
+            if backup is not None and backup.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(backup, target)
+        except OSError as exc:
+            errors.append(f"{change.path}: {exc}")
+    return errors
+
+
+def _remove_created_dirs(created_dirs: set[Path], repo_root: Path) -> None:
+    for directory in sorted(created_dirs, key=lambda item: len(item.parts), reverse=True):
+        if directory == repo_root:
+            continue
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def _cleanup_transaction_dir(transaction_dir: Path, transaction_parent: Path) -> OSError | None:
+    try:
+        shutil.rmtree(transaction_dir)
+        try:
+            transaction_parent.rmdir()
+        except OSError:
+            pass
+        return None
+    except OSError as exc:
+        return exc
 
 
 def _missing_parent_dirs(path: Path, repo_root: Path) -> set[Path]:
@@ -341,8 +395,8 @@ def _missing_parent_dirs(path: Path, repo_root: Path) -> set[Path]:
 
 
 def _line_change_counts(before: bytes | None, after: bytes | None) -> tuple[int, int]:
-    old_lines = [] if before is None else before.decode("utf-8", errors="replace").splitlines()
-    new_lines = [] if after is None else after.decode("utf-8", errors="replace").splitlines()
+    old_lines = [] if before is None else before.decode("utf-8", errors="replace").splitlines(keepends=True)
+    new_lines = [] if after is None else after.decode("utf-8", errors="replace").splitlines(keepends=True)
     additions = 0
     deletions = 0
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=old_lines, b=new_lines).get_opcodes():
