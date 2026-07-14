@@ -34,7 +34,11 @@ from app.services.workspaces import WorkspaceService
 from app.storage.audit import AuditStore
 from app.workspace.manager import WorkspaceManager, split_command
 from app.workspace.models import CommandResult
-from app.workspace.text_ops import PreparedFileChange, commit_prepared_changes
+from app.workspace.text_ops import (
+    PreparedFileChange,
+    _rollback_committed_changes,
+    commit_prepared_changes,
+)
 
 _prepare_counter = itertools.count()
 
@@ -1320,7 +1324,10 @@ def test_partial_stage_write_is_cleaned_from_git_transaction_directory(tmp_path:
     assert git("status", "--porcelain", cwd=repo_dir) == "?? first.txt"
 
 
-def test_transaction_cleanup_failure_rolls_back_workspace_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_partial_transaction_cleanup_failure_preserves_committed_workspace_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     _, repo_dir = make_local_repo(tmp_path)
     target = repo_dir / "README.md"
     before_bytes = target.read_bytes()
@@ -1332,22 +1339,42 @@ def test_transaction_cleanup_failure_rolls_back_workspace_change(tmp_path: Path,
     )
     transaction_parent = repo_dir / ".git" / "gpt-workspace-transactions"
     real_rmtree = shutil.rmtree
-    calls = 0
 
-    def fail_once(path: str | os.PathLike[str], *args, **kwargs) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise PermissionError("injected cleanup failure")
-        real_rmtree(path, *args, **kwargs)
+    def delete_backups_then_fail(path: str | os.PathLike[str], *args, **kwargs) -> None:
+        transaction_dir = Path(path)
+        backups = transaction_dir / "backups"
+        if backups.exists():
+            real_rmtree(backups)
+        raise PermissionError("injected failure after backups were deleted")
 
-    monkeypatch.setattr("app.workspace.text_ops.shutil.rmtree", fail_once)
-    with pytest.raises(OSError, match="committed changes were rolled back"):
+    monkeypatch.setattr(
+        "app.workspace.text_ops.shutil.rmtree",
+        delete_backups_then_fail,
+    )
+    with pytest.raises(OSError, match="committed files were left intact"):
         commit_prepared_changes(repo_dir, [change])
 
-    assert target.read_bytes() == before_bytes
-    assert not transaction_parent.exists()
-    assert git("status", "--porcelain", cwd=repo_dir) == ""
+    assert target.read_bytes() == b"after\n"
+    assert transaction_parent.exists()
+    assert git("status", "--porcelain", cwd=repo_dir) == "M README.md"
+
+
+def test_rollback_without_backup_keeps_current_target(tmp_path: Path):
+    target = tmp_path / "alpha.txt"
+    target.write_bytes(b"committed\n")
+    change = PreparedFileChange(
+        path="alpha.txt",
+        resolved_path=target,
+        before=b"before\n",
+        after=b"committed\n",
+    )
+
+    errors = _rollback_committed_changes([change], {})
+
+    assert errors == [
+        "alpha.txt: backup is unavailable; the current target was left intact"
+    ]
+    assert target.read_bytes() == b"committed\n"
 
 
 def test_write_response_matches_final_git_state_relative_to_head(tmp_path: Path):
@@ -1357,6 +1384,48 @@ def test_write_response_matches_final_git_state_relative_to_head(tmp_path: Path)
     repo_dir = manager.repo_dir(prepared.workspace_id)
     readme = repo_dir / "README.md"
     readme.write_text("dirty\n", encoding="utf-8")
+
+    unchanged = run(
+        service.write_file(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceWriteFileRequest(
+                path="README.md",
+                content="dirty\n",
+                mode="overwrite",
+            ),
+        )
+    )
+    assert unchanged.operation == "unchanged"
+    assert unchanged.written is False
+    assert len(unchanged.changed_files) == 1
+    assert unchanged.changed_files[0].path == "README.md"
+    assert unchanged.changed_files[0].operation == "modified"
+    assert unchanged.diff_stat
+    assert git("status", "--porcelain", cwd=repo_dir) == "M README.md"
+
+    no_op_patch = run(
+        service.apply_patch(
+            "acme",
+            "demo",
+            prepared.workspace_id,
+            WorkspaceApplyPatchRequest(
+                patch=(
+                    "*** Begin Patch\n"
+                    "*** Update File: README.md\n"
+                    "@@\n"
+                    " dirty\n"
+                    "*** End Patch\n"
+                ),
+                dry_run=True,
+            ),
+        )
+    )
+    assert no_op_patch.applied is False
+    assert len(no_op_patch.changed_files) == 1
+    assert no_op_patch.changed_files[0].operation == "modified"
+    assert no_op_patch.diff_stat
 
     response = run(
         service.write_file(

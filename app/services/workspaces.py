@@ -855,7 +855,21 @@ class WorkspaceService:
             target_paths = list(dict.fromkeys(item.path for item in operations))
             snapshots = snapshot_files(repo_dir, target_paths)
             prepared = prepare_text_patch(repo_dir, operations, snapshots)
-            changed, diff_stat = await self._describe_prepared_git_changes(repo_dir, prepared)
+            prepared_by_path = {item.path: item for item in prepared}
+            expected = [
+                PreparedFileChange(
+                    path=snapshot.path,
+                    resolved_path=snapshot.resolved_path,
+                    before=snapshot.data,
+                    after=(
+                        prepared_by_path[snapshot.path].after
+                        if snapshot.path in prepared_by_path
+                        else snapshot.data
+                    ),
+                )
+                for snapshot in snapshots
+            ]
+            changed, diff_stat = await self._describe_prepared_git_changes(repo_dir, expected)
             if len(changed) > max_changed_files:
                 raise ApiError(
                     ErrorCode.WORKSPACE_TOO_MANY_CHANGED_FILES,
@@ -863,7 +877,7 @@ class WorkspaceService:
                     status_code=413,
                     details={"count": len(changed), "max": max_changed_files},
                 )
-            self._validate_prepared_changes(prepared, changed)
+            self._validate_prepared_changes(expected, changed)
             if not request.dry_run:
                 try:
                     commit_prepared_changes(repo_dir, prepared)
@@ -932,12 +946,18 @@ class WorkspaceService:
             else:
                 operation = "modified"
 
-            changed: list[ChangedFile] = []
-            diff_stat = ""
+            expected = [
+                PreparedFileChange(
+                    path=path,
+                    resolved_path=resolved,
+                    before=previous_bytes,
+                    after=data,
+                )
+            ]
+            changed, diff_stat = await self._describe_prepared_git_changes(repo_dir, expected)
+            self._validate_prepared_changes(expected, changed)
             if operation != "unchanged":
                 prepared = prepare_write_change(path=path, resolved_path=resolved, before=previous_bytes, after=data)
-                changed, diff_stat = await self._describe_prepared_git_changes(repo_dir, prepared)
-                self._validate_prepared_changes(prepared, changed)
                 if not request.dry_run:
                     try:
                         commit_prepared_changes(repo_dir, prepared)
