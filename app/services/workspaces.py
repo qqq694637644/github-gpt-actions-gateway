@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -16,6 +19,7 @@ from app.errors import ApiError, ErrorCode
 from app.github.client import GitHubClient
 from app.models.branches import CreateWorkBranchRequest, CreateWorkBranchResponse
 from app.models.ci import SyncedRunArtifact, SyncRunArtifactsToWorkspaceRequest, SyncRunArtifactsToWorkspaceResponse
+from app.models.common import ChangedFile
 from app.models.workspaces import (
     PrepareWorkspaceRequest,
     PrepareWorkspaceResponse,
@@ -56,12 +60,15 @@ from app.storage.audit import AuditStore, canonical_hash
 from app.workspace.manager import WorkspaceManager, command_hash
 from app.workspace.operations import WorkspaceOperationManager
 from app.workspace.text_ops import (
-    apply_text_patch,
+    PreparedFileChange,
     assert_payload_size,
     assert_text_bytes,
+    commit_prepared_changes,
+    describe_prepared_changes,
     normalize_line_endings,
     parse_codex_patch,
-    restore_files,
+    prepare_text_patch,
+    prepare_write_change,
     sha256_hex,
     snapshot_files,
     validate_write_target,
@@ -541,24 +548,24 @@ class WorkspaceService:
             output_lines: list[str] = []
             output_bytes = 0
             truncated = start_idx + len(selected) < len(lines)
+            next_start_line: int | None = start_line + len(selected) if truncated else None
             for offset, line in enumerate(selected, start=start_line):
                 rendered = f"{offset}: {line}"
                 rendered_bytes = len((rendered + "\n").encode("utf-8"))
                 if rendered_bytes > max_bytes:
-                    clipped, _ = _clip_text_to_bytes(rendered, max_bytes)
-                    if clipped:
-                        output_lines.append(clipped)
-                        output_bytes += len(clipped.encode("utf-8"))
                     truncated = True
+                    next_start_line = offset
                     break
                 if output_bytes + rendered_bytes > max_bytes:
                     truncated = True
+                    next_start_line = offset
                     break
                 output_lines.append(rendered)
                 output_bytes += rendered_bytes
             end_line = start_line + len(output_lines) - 1 if output_lines else None
             content = "\n".join(output_lines)
             content, content_truncated = _clip_text_to_bytes(content, max_bytes)
+            was_truncated = truncated or content_truncated
             return WorkspaceFileContent(
                 path=normalized,
                 start_line=start_line,
@@ -567,7 +574,8 @@ class WorkspaceService:
                 bytes=len(data),
                 sha256=hashlib.sha256(data).hexdigest(),
                 content=content,
-                truncated=truncated or content_truncated,
+                truncated=was_truncated,
+                next_start_line=next_start_line if was_truncated else None,
             )
         except Exception as exc:
             if isinstance(exc, ApiError):
@@ -613,12 +621,99 @@ class WorkspaceService:
             )
         return max_bytes
 
+    def _validate_prepared_changes(self, changes: list[PreparedFileChange], changed_files: list[ChangedFile]) -> None:
+        changed_by_path = {item.path: item for item in changed_files}
+        for change in changes:
+            changed = changed_by_path.get(change.path)
+            operation = changed.operation if changed is not None else ("deleted" if change.after is None else "modified")
+            self.policy.assert_write_path_allowed(change.path, operation=operation)
+            if change.after is None:
+                continue
+            self.policy.assert_file_size(len(change.after), max_size=self.settings.max_blob_read_bytes)
+            if self.policy.looks_binary(change.after):
+                raise ApiError(
+                    ErrorCode.BINARY_FILE_NOT_ALLOWED,
+                    "Non-text changes are not allowed in workspace text operations.",
+                    status_code=403,
+                    details={"path": change.path},
+                )
+
+    async def _describe_prepared_git_changes(
+        self,
+        repo_dir: Path,
+        changes: list[PreparedFileChange],
+    ) -> tuple[list[ChangedFile], str]:
+        final_changes: list[PreparedFileChange] = []
+        for change in changes:
+            head_bytes = await self._read_head_blob(repo_dir, change.path)
+            if head_bytes == change.after:
+                continue
+            final_changes.append(
+                PreparedFileChange(
+                    path=change.path,
+                    resolved_path=change.resolved_path,
+                    before=head_bytes,
+                    after=change.after,
+                )
+            )
+        return describe_prepared_changes(final_changes)
+
+    async def _read_head_blob(self, repo_dir: Path, path: str) -> bytes | None:
+        max_bytes = self.settings.max_blob_read_bytes
+
+        def read_blob() -> bytes | None:
+            with tempfile.SpooledTemporaryFile(max_size=max_bytes + 1) as output:
+                result = subprocess.run(
+                    [
+                        "git",
+                        "cat-file",
+                        "--filters",
+                        f"--path={path}",
+                        f"HEAD:{path}",
+                    ],
+                    cwd=repo_dir,
+                    stdout=output,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if result.returncode == 128:
+                    return None
+                if result.returncode != 0:
+                    raise ApiError(
+                        ErrorCode.WORKSPACE_EXEC_FAILED,
+                        "Unable to read the HEAD version of a workspace file.",
+                        status_code=500,
+                        details={
+                            "path": path,
+                            "exit_code": result.returncode,
+                            "stderr": result.stderr.decode("utf-8", errors="replace"),
+                        },
+                    )
+                output.seek(0)
+                data = output.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise ApiError(
+                        ErrorCode.WORKSPACE_POLICY_VIOLATION,
+                        "The HEAD version of a workspace file exceeds the configured size limit.",
+                        status_code=413,
+                        details={"path": path, "max_bytes": max_bytes},
+                    )
+                return data
+
+        return await asyncio.to_thread(read_blob)
+
     def _fit_read_files_response(self, response: WorkspaceReadFilesResponse, max_bytes: int) -> WorkspaceReadFilesResponse:
         while _model_json_bytes(response) > max_bytes and response.files:
             files = list(response.files)
             last_file = files[-1]
             if last_file.content:
-                files[-1] = last_file.model_copy(update={"content": "", "truncated": True})
+                files[-1] = last_file.model_copy(
+                    update={
+                        "content": "",
+                        "truncated": True,
+                        "next_start_line": last_file.start_line,
+                    }
+                )
             else:
                 files.pop()
             response = response.model_copy(update={"files": files, "truncated": True})
@@ -657,7 +752,13 @@ class WorkspaceService:
                 files = list(response.files)
                 last_file = files[-1]
                 if last_file.content:
-                    files[-1] = last_file.model_copy(update={"content": "", "truncated": True})
+                    files[-1] = last_file.model_copy(
+                        update={
+                            "content": "",
+                            "truncated": True,
+                            "next_start_line": last_file.start_line,
+                        }
+                    )
                 else:
                     files.pop()
                 response = response.model_copy(update={"files": files, "truncated": True})
@@ -753,27 +854,48 @@ class WorkspaceService:
             operations = parse_codex_patch(request.patch, self.policy, repo_dir, allow_delete=request.allow_delete, max_changed_files=max_changed_files)
             target_paths = list(dict.fromkeys(item.path for item in operations))
             snapshots = snapshot_files(repo_dir, target_paths)
-            should_restore = True
-            try:
-                apply_text_patch(repo_dir, operations)
-                changed = await self.manager.changed_files_for_paths(repo_dir, target_paths)
-                if len(changed) > max_changed_files:
-                    raise ApiError(ErrorCode.WORKSPACE_TOO_MANY_CHANGED_FILES, "Patch changes too many files.", status_code=413, details={"count": len(changed), "max": max_changed_files})
-                await self.manager.validate_changed_paths(repo_dir, changed)
-                diff_stat = await self.manager.diff_stat_for_paths(repo_dir, target_paths)
-                response = WorkspaceApplyPatchResponse(
-                    applied=not request.dry_run,
-                    dry_run=request.dry_run,
-                    changed_files=changed,
-                    diff_stat=diff_stat,
+            prepared = prepare_text_patch(repo_dir, operations, snapshots)
+            prepared_by_path = {item.path: item for item in prepared}
+            expected = [
+                PreparedFileChange(
+                    path=snapshot.path,
+                    resolved_path=snapshot.resolved_path,
+                    before=snapshot.data,
+                    after=(
+                        prepared_by_path[snapshot.path].after
+                        if snapshot.path in prepared_by_path
+                        else snapshot.data
+                    ),
                 )
-                should_restore = request.dry_run
-            except Exception:
-                restore_files(repo_dir, snapshots)
-                raise
-            finally:
-                if should_restore:
-                    restore_files(repo_dir, snapshots)
+                for snapshot in snapshots
+            ]
+            changed, diff_stat = await self._describe_prepared_git_changes(repo_dir, expected)
+            if len(changed) > max_changed_files:
+                raise ApiError(
+                    ErrorCode.WORKSPACE_TOO_MANY_CHANGED_FILES,
+                    "Patch changes too many files.",
+                    status_code=413,
+                    details={"count": len(changed), "max": max_changed_files},
+                )
+            self._validate_prepared_changes(expected, changed)
+            if not request.dry_run:
+                try:
+                    commit_prepared_changes(repo_dir, prepared)
+                except Exception as exc:
+                    if isinstance(exc, ApiError):
+                        raise
+                    raise ApiError(
+                        ErrorCode.WORKSPACE_WRITE_FAILED,
+                        "Failed to commit the prepared workspace patch.",
+                        status_code=500,
+                        details={"paths": target_paths, "error": str(exc)},
+                    ) from exc
+            response = WorkspaceApplyPatchResponse(
+                applied=not request.dry_run,
+                dry_run=request.dry_run,
+                changed_files=changed,
+                diff_stat=diff_stat,
+            )
         self._audit(
             operation_id="workspaceApplyPatch",
             owner=owner,
@@ -824,28 +946,30 @@ class WorkspaceService:
             else:
                 operation = "modified"
 
-            changed = []
-            diff_stat = ""
+            expected = [
+                PreparedFileChange(
+                    path=path,
+                    resolved_path=resolved,
+                    before=previous_bytes,
+                    after=data,
+                )
+            ]
+            changed, diff_stat = await self._describe_prepared_git_changes(repo_dir, expected)
+            self._validate_prepared_changes(expected, changed)
             if operation != "unchanged":
-                snapshots = snapshot_files(repo_dir, [path])
-                should_restore = True
-                try:
-                    resolved.parent.mkdir(parents=True, exist_ok=True)
-                    resolved.write_bytes(data)
-                    changed = await self.manager.changed_files_for_paths(repo_dir, [path])
-                    if len(changed) > 1:
-                        raise ApiError(ErrorCode.WORKSPACE_TOO_MANY_CHANGED_FILES, "write-file unexpectedly changed more than one file.", status_code=409, details={"count": len(changed)})
-                    await self.manager.validate_changed_paths(repo_dir, changed)
-                    diff_stat = await self.manager.diff_stat_for_paths(repo_dir, [path])
-                    should_restore = request.dry_run
-                except Exception as exc:
-                    restore_files(repo_dir, snapshots)
-                    if isinstance(exc, ApiError):
-                        raise
-                    raise ApiError(ErrorCode.WORKSPACE_WRITE_FAILED, "Failed to write workspace file.", status_code=500, details={"path": path, "error": str(exc)}) from exc
-                finally:
-                    if should_restore:
-                        restore_files(repo_dir, snapshots)
+                prepared = prepare_write_change(path=path, resolved_path=resolved, before=previous_bytes, after=data)
+                if not request.dry_run:
+                    try:
+                        commit_prepared_changes(repo_dir, prepared)
+                    except Exception as exc:
+                        if isinstance(exc, ApiError):
+                            raise
+                        raise ApiError(
+                            ErrorCode.WORKSPACE_WRITE_FAILED,
+                            "Failed to write workspace file.",
+                            status_code=500,
+                            details={"path": path, "error": str(exc)},
+                        ) from exc
             response = WorkspaceWriteFileResponse(
                 written=bool(operation != "unchanged" and not request.dry_run),
                 dry_run=request.dry_run,
