@@ -30,14 +30,13 @@ DENY_WRITE_PATTERNS = [
     "myvenv/**",
     ".tox/**",
     ".nox/**",
-    "dist/**",
     "build/**",
     "coverage/**",
     ".git/**",
 ]
 WORKFLOW_PATTERNS = [".github/workflows/*"]
 LOCAL_ENV_DIRS = {".venv", "venv", "env", "myvenv", ".tox", ".nox"}
-DENY_WRITE_DIRS = {".git", "dist", "build", "node_modules", "vendor", ".next", ".turbo", "coverage", *LOCAL_ENV_DIRS}
+DENY_WRITE_DIRS = {".git", "build", "node_modules", "vendor", ".next", ".turbo", "coverage", *LOCAL_ENV_DIRS}
 BINARY_DENY_EXTENSIONS = {
     ".png",
     ".jpg",
