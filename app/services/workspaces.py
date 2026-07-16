@@ -81,7 +81,6 @@ _SAFE_ARTIFACT_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _EXCLUDED_INSPECT_DIRS = {
     ".git",
     "node_modules",
-    "dist",
     "build",
     "coverage",
     "__pycache__",
