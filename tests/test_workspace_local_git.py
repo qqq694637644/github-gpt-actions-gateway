@@ -1057,6 +1057,35 @@ def test_workspace_apply_patch_dry_run_and_apply_do_not_push(tmp_path: Path):
     assert git("rev-parse", "gpt/task", cwd=remote) == original_remote_head
 
 
+def test_workspace_apply_patch_preserves_crlf_and_reports_only_content_change(tmp_path: Path):
+    remote, source = make_local_repo(tmp_path)
+    (source / "README.md").write_bytes(b"one\nbefore\nthree\n")
+    git("add", "README.md", cwd=source)
+    git("commit", "-m", "Use multiline readme", cwd=source)
+    git("push", "origin", "gpt/task", cwd=source)
+    service, manager = make_service(tmp_path, remote)
+
+    prepared = run(service.prepare("acme", "demo", prepare_request(branch="gpt/task")))
+    repo_dir = manager.repo_dir(prepared.workspace_id)
+    git("config", "core.autocrlf", "true", cwd=repo_dir)
+    target = repo_dir / "README.md"
+    original = b"one\r\nbefore\r\nthree\r\n"
+    target.write_bytes(original)
+    patch = "*** Begin Patch\n*** Update File: README.md\n@@\n-before\n+after\n*** End Patch\n"
+
+    dry = run(service.apply_patch("acme", "demo", prepared.workspace_id, WorkspaceApplyPatchRequest(patch=patch, dry_run=True)))
+    assert dry.applied is False
+    assert dry.changed_files[0].additions == 1
+    assert dry.changed_files[0].deletions == 1
+    assert target.read_bytes() == original
+
+    applied = run(service.apply_patch("acme", "demo", prepared.workspace_id, WorkspaceApplyPatchRequest(patch=patch)))
+    assert applied.applied is True
+    assert applied.changed_files[0].additions == 1
+    assert applied.changed_files[0].deletions == 1
+    assert target.read_bytes() == b"one\r\nafter\r\nthree\r\n"
+
+
 def test_workspace_apply_patch_rejects_delete_by_default(tmp_path: Path):
     remote, _ = make_local_repo(tmp_path)
     service, _ = make_service(tmp_path, remote)
