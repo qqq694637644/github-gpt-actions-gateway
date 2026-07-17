@@ -84,6 +84,27 @@ class ApiError(Exception):
         return ErrorResponse(error_code=self.error_code, message=self.message, suggestion=self.suggestion, details=self.details)
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert nested error details into values accepted by JSONResponse.
+
+    Pydantic validation errors may include the original exception in
+    ``ctx.error``.  Returning ``exc.errors()`` directly therefore causes a
+    second failure while serializing the error response, hiding the useful
+    validation message from the caller.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, BaseModel):
+        return _json_safe(value.model_dump())
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Exception):
+        return str(value)
+    return str(value)
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
@@ -95,7 +116,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             error_code=ErrorCode.VALIDATION_ERROR,
             message="Request validation failed.",
             suggestion="Check required fields, field types, and allowed enum values.",
-            details={"errors": exc.errors()},
+            details={"errors": _json_safe(exc.errors())},
         )
         return JSONResponse(status_code=422, content=response.model_dump())
 
