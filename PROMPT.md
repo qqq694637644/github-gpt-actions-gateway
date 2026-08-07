@@ -74,7 +74,7 @@ start -> get / logs -> terminal state
 list
 ```
 
-`start` 需要唯一 `idempotency_key`。相同 key 和相同请求返回原 operation；相同 key 和不同请求返回 `IDEMPOTENCY_KEY_REUSED`。连接异常时复用原 key，或用 `list` / `workspaceStatus` 查找 operation。
+`start` 需要 `idempotency_key`。幂等身份由 `idempotency_key` 与规范化请求哈希共同确定：相同 key 和相同请求返回原 operation；相同 key 但不同请求创建新的 operation。连接异常时复用原 key 和原请求，或用 `list` / `workspaceStatus` 查找 operation。
 
 保存 `operation_id`：用 `get` 查询状态，用 `logs` 和 stdout/stderr offset 增量读取日志，用 `cancel` 终止进程树。必须查询到 `succeeded`、`failed`、`timed_out`、`canceled` 或 `interrupted`；仅启动成功不代表验证通过。
 

@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from app.config.settings import Settings
-from app.errors import ApiError, ErrorCode
 from app.models.workspaces import WorkspaceCommandStartRequest
 from app.workspace import operations as operations_module
 from app.workspace.exec import build_pwsh_script, strip_ansi_escape_sequences
@@ -516,7 +515,7 @@ def test_timeout_is_a_hard_deadline_and_process_tree_is_terminated(tmp_path: Pat
     run(scenario())
 
 
-def test_start_rejects_reused_idempotency_key_with_different_payload(tmp_path: Path) -> None:
+def test_start_allows_reused_idempotency_key_with_different_payload(tmp_path: Path) -> None:
     async def scenario() -> None:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
@@ -534,22 +533,22 @@ def test_start_rejects_reused_idempotency_key_with_different_payload(tmp_path: P
             activate_python_venv=False,
             python_venv_dir=".venv",
         )
-        with pytest.raises(ApiError) as exc:
-            await manager.start(
-                workspace_id="ws_idem",
-                repo_dir=repo_dir,
-                idempotency_key="command_same",
-                script="Write-Output two",
-                timeout_seconds=10,
-                max_output_bytes=20_000,
-                allow_network=False,
-                plain_output=False,
-                utf8_output=True,
-                activate_python_venv=False,
-                python_venv_dir=".venv",
-            )
-        assert exc.value.error_code == ErrorCode.IDEMPOTENCY_KEY_REUSED
+        second = await manager.start(
+            workspace_id="ws_idem",
+            repo_dir=repo_dir,
+            idempotency_key="command_same",
+            script="Write-Output two",
+            timeout_seconds=10,
+            max_output_bytes=20_000,
+            allow_network=False,
+            plain_output=False,
+            utf8_output=True,
+            activate_python_venv=False,
+            python_venv_dir=".venv",
+        )
+        assert second["operation_id"] != first["operation_id"]
         await wait_terminal(manager, "ws_idem", first["operation_id"])
+        await wait_terminal(manager, "ws_idem", second["operation_id"])
         await manager.shutdown()
 
     run(scenario())
